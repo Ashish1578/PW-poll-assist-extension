@@ -28,7 +28,7 @@ Not published on the Chrome Web Store — you load it directly from this repo.
 
 1. **Download or clone this repository**
    ```bash
-   git clone https://github.com/<your-username>/pw-poll-extension.git
+   git clone https://github.com/dottedcondom/pw-poll-extension.git
    ```
 2. Open Chrome and go to `chrome://extensions`
 3. Toggle on **Developer mode** (top right)
