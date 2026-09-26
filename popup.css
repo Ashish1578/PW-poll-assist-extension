@@ -1,0 +1,378 @@
+/* ============================================================
+   Poll Assist — popup design tokens
+   Premium dark surface: translucent layering with a glass-edge
+   highlight, a single vivid accent with real depth (glow, not a
+   flat fill), spring-like easing on interactive elements, and
+   hover feedback throughout. Same visual language as the in-page
+   control (overlay.css) for one cohesive product feel.
+   ============================================================ */
+:root {
+  --bg: #0a0b0d;
+  --surface: rgba(255, 255, 255, 0.035);
+  --surface-hover: rgba(255, 255, 255, 0.055);
+  --border: rgba(255, 255, 255, 0.08);
+  --edge-highlight: rgba(255, 255, 255, 0.09);
+  --text: #f7f8f8;
+  --text-dim: #8a8f98;
+  --text-faint: #5c6169;
+  --accent: #34d399;
+  --accent-glow: rgba(52, 211, 153, 0.35);
+  --warning: #f0b458;
+  --danger: #f47174;
+  --ease-smooth: cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  width: 304px;
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ---- Header ---- */
+.app-header {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 18px 18px 14px;
+  overflow: hidden;
+}
+
+.app-header::before {
+  content: "";
+  position: absolute;
+  top: -34px;
+  left: 6px;
+  width: 100px;
+  height: 100px;
+  background: radial-gradient(circle, var(--accent-glow) 0%, rgba(52, 211, 153, 0.08) 45%, transparent 72%);
+  pointer-events: none;
+}
+
+.app-icon {
+  position: relative;
+  border-radius: 7px;
+  flex-shrink: 0;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.35);
+}
+
+.app-header h1 {
+  position: relative;
+  font-size: 14px;
+  margin: 0;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  flex: 1;
+}
+
+.version-badge {
+  position: relative;
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--text-faint);
+  letter-spacing: 0.02em;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---- Settings card ---- */
+.settings-section {
+  position: relative;
+  margin: 0 14px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  box-shadow: inset 0 1px 0 var(--edge-highlight), 0 6px 20px rgba(0, 0, 0, 0.25);
+}
+
+.settings-section + .settings-section {
+  margin-top: 10px;
+}
+
+.setting-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 13px 14px;
+  border-bottom: 1px solid var(--border);
+  border-radius: 10px;
+  transition: background 0.2s var(--ease-smooth);
+}
+
+.setting-row:hover {
+  background: var(--surface-hover);
+}
+
+.settings-section .setting-row:first-child {
+  border-top-left-radius: 14px;
+  border-top-right-radius: 14px;
+}
+
+.settings-section .setting-row:last-child {
+  border-bottom: none;
+  border-bottom-left-radius: 14px;
+  border-bottom-right-radius: 14px;
+}
+
+.setting-row.column {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 9px;
+  cursor: default;
+}
+
+.setting-label {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.setting-title {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text);
+  letter-spacing: -0.005em;
+}
+
+.setting-desc {
+  font-size: 11px;
+  color: var(--text-dim);
+  line-height: 1.45;
+}
+
+/* ---- Toggle switch ---- */
+.switch {
+  position: relative;
+  display: inline-block;
+  flex-shrink: 0;
+  cursor: pointer;
+}
+
+.switch input {
+  position: absolute;
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+
+.switch-track {
+  display: flex;
+  align-items: center;
+  width: 36px;
+  height: 21px;
+  padding: 0 3px;
+  background: rgba(255, 255, 255, 0.1);
+  border-radius: 999px;
+  transition: background 0.25s var(--ease-smooth), box-shadow 0.25s var(--ease-smooth);
+}
+
+.switch-thumb {
+  display: block;
+  width: 15px;
+  height: 15px;
+  flex-shrink: 0;
+  background: #e8eaec;
+  border-radius: 50%;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);
+  transition: transform 0.32s var(--ease-spring), background 0.2s var(--ease-smooth);
+}
+
+.switch input:checked + .switch-track {
+  background: var(--accent);
+  box-shadow: 0 0 14px var(--accent-glow);
+}
+
+.switch input:checked + .switch-track .switch-thumb {
+  transform: translateX(15px);
+  background: #06120e;
+}
+
+.switch input:focus-visible + .switch-track {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* ---- Delay slider + live value readout ---- */
+.delay-control {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+/* Custom-styled range input: the fill-to-value gradient is driven by a
+   --pct custom property (set in JS on load and on every 'input' event),
+   since range inputs have no native way to express "filled portion" —
+   this is the standard technique behind every premium slider you've
+   seen (Stripe, Arc, native macOS controls). */
+.slider {
+  --pct: 0%;
+  flex: 1;
+  -webkit-appearance: none;
+  appearance: none;
+  height: 5px;
+  border-radius: 999px;
+  background: linear-gradient(
+    to right,
+    var(--accent) 0%,
+    var(--accent) var(--pct),
+    rgba(255, 255, 255, 0.1) var(--pct),
+    rgba(255, 255, 255, 0.1) 100%
+  );
+  cursor: pointer;
+  outline: none;
+  margin: 8px 0; /* room for the thumb to grow on hover without clipping */
+}
+
+.slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 15px;
+  height: 15px;
+  border-radius: 50%;
+  background: #fdfdfd;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.4), 0 0 0 3px var(--accent-glow);
+  cursor: pointer;
+  transition: transform 0.18s var(--ease-spring), box-shadow 0.2s var(--ease-smooth);
+}
+
+.slider:hover::-webkit-slider-thumb {
+  transform: scale(1.15);
+}
+
+.slider:active::-webkit-slider-thumb {
+  transform: scale(1.3);
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.45), 0 0 0 5px var(--accent-glow);
+}
+
+.slider:focus-visible::-webkit-slider-thumb {
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.4), 0 0 0 3px var(--accent);
+}
+
+.slider::-moz-range-track {
+  height: 5px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.1);
+}
+
+.slider::-moz-range-progress {
+  height: 5px;
+  border-radius: 999px;
+  background: var(--accent);
+}
+
+.slider::-moz-range-thumb {
+  width: 15px;
+  height: 15px;
+  border: none;
+  border-radius: 50%;
+  background: #fdfdfd;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.4), 0 0 0 3px var(--accent-glow);
+  cursor: pointer;
+  transition: transform 0.18s var(--ease-spring);
+}
+
+.slider:hover::-moz-range-thumb {
+  transform: scale(1.15);
+}
+
+/* Live value readout — styled as a small precise "spec chip" rather
+   than a plain text box, with the unit fused inside it. */
+.delay-value {
+  display: flex;
+  align-items: baseline;
+  gap: 1px;
+  flex-shrink: 0;
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 5px 8px 5px 9px;
+  box-shadow: inset 0 1px 0 var(--edge-highlight);
+  transition: border-color 0.2s var(--ease-smooth), background 0.2s var(--ease-smooth);
+}
+
+.delay-value:focus-within {
+  border-color: var(--accent);
+  background: rgba(255, 255, 255, 0.07);
+}
+
+.number-input {
+  width: 40px;
+  background: none;
+  border: none;
+  color: var(--text);
+  padding: 0;
+  font-size: 13px;
+  font-weight: 600;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  outline: none;
+}
+
+.unit {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-dim);
+}
+
+/* ---- Footer ---- */
+.app-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 18px 16px;
+}
+
+.text-btn {
+  background: none;
+  border: none;
+  color: var(--text-dim);
+  font-size: 11.5px;
+  font-weight: 600;
+  cursor: pointer;
+  padding: 5px 9px;
+  margin: -5px -9px;
+  border-radius: 6px;
+  transition: color 0.2s var(--ease-smooth), background 0.2s var(--ease-smooth);
+}
+
+.text-btn:hover {
+  color: var(--text);
+  background: var(--surface-hover);
+}
+
+.text-btn:active {
+  transform: scale(0.97);
+}
+
+.text-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.save-indicator {
+  font-size: 10.5px;
+  font-weight: 600;
+  color: var(--accent);
+  opacity: 0;
+  transform: translateY(2px);
+  transition: opacity 0.25s var(--ease-smooth), transform 0.25s var(--ease-smooth);
+}
+
+.save-indicator.visible {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+.save-indicator.error {
+  color: var(--danger);
+}

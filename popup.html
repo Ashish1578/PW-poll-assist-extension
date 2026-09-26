@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Poll Assist</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <header class="app-header">
+    <img src="icons/icon48.png" alt="" class="app-icon" width="26" height="26">
+    <h1>Poll Assist</h1>
+    <span class="version-badge" id="versionBadge"></span>
+  </header>
+
+  <section class="settings-section">
+    <div class="setting-row">
+      <div class="setting-label">
+        <span class="setting-title">Auto-submit</span>
+        <span class="setting-desc">Click Submit once your pre-chosen answer is selected.</span>
+      </div>
+      <label class="switch">
+        <input type="checkbox" id="autoSubmitEnabled">
+        <span class="switch-track"><span class="switch-thumb"></span></span>
+      </label>
+    </div>
+
+    <div class="setting-row column">
+      <div class="setting-label">
+        <span class="setting-title">Delay before submitting</span>
+        <span class="setting-desc">Time to wait after selecting an answer before clicking Submit.</span>
+      </div>
+      <div class="delay-control">
+        <input type="range" id="submitDelay" min="0" max="5" step="0.1" class="slider">
+        <div class="delay-value">
+          <input type="number" id="submitDelayNumber" min="0" max="60" step="0.05" class="number-input">
+          <span class="unit">s</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="setting-row">
+      <div class="setting-label">
+        <span class="setting-title">Hide with video controls</span>
+        <span class="setting-desc">Fades with real mouse activity over the player.</span>
+      </div>
+      <label class="switch">
+        <input type="checkbox" id="hideWithPlayerControls">
+        <span class="switch-track"><span class="switch-thumb"></span></span>
+      </label>
+    </div>
+
+    <div class="setting-row">
+      <div class="setting-label">
+        <span class="setting-title">Auto-open poll panel</span>
+        <span class="setting-desc">Opens the panel as soon as a poll becomes available.</span>
+      </div>
+      <label class="switch">
+        <input type="checkbox" id="autoOpenPollPanel">
+        <span class="switch-track"><span class="switch-thumb"></span></span>
+      </label>
+    </div>
+  </section>
+
+  <div class="section-divider"></div>
+
+  <section class="settings-section">
+    <div class="setting-row">
+      <div class="setting-label">
+        <span class="setting-title">Debug logging</span>
+        <span class="setting-desc">Verbose console output (F12) for troubleshooting.</span>
+      </div>
+      <label class="switch">
+        <input type="checkbox" id="debug">
+        <span class="switch-track"><span class="switch-thumb"></span></span>
+      </label>
+    </div>
+  </section>
+
+  <footer class="app-footer">
+    <button id="resetBtn" class="text-btn">Reset to defaults</button>
+    <span id="statusMsg" class="save-indicator" aria-live="polite"></span>
+  </footer>
+
+  <script src="popup.js"></script>
+</body>
+</html>

@@ -1,0 +1,7 @@
+.DS_Store
+Thumbs.db
+*.log
+*.zip
+node_modules/
+__pycache__/
+.vscode/
