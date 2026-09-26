@@ -6,6 +6,10 @@ A small Chrome extension for PW.live **live classes**. Pick the answer you've al
 
 > **Unofficial project.** Not affiliated with, endorsed by, or connected to Physics Wallah or PW.live in any way. It may break whenever PW.live changes their site.
 
+<p align="center">
+  <img src="screenshots/poll-panel.png" alt="Poll Assist panel with option B armed and auto-submit on" width="420">
+</p>
+
 ## Table of contents
 
 - [Installation](#installation)
