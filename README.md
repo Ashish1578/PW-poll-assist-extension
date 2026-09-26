@@ -1,102 +1,140 @@
 # Poll Assist for PW Live
 
-![License: MIT](https://img.shields.io/badge/license-MIT-4caf50.svg)
-![Manifest V3](https://img.shields.io/badge/manifest-v3-blue.svg)
-![Platform](https://img.shields.io/badge/platform-Chrome-yellow.svg)
-![Status](https://img.shields.io/badge/status-personal%20project-lightgrey.svg)
+**A Manifest V3 Chrome extension that intercepts a live-class WebSocket feed to detect polls in real time and auto-submit a pre-armed answer — built without frameworks, build tools, or third-party dependencies.**
 
-A small, unofficial Chrome extension that pre-selects a poll answer and
-submits it the instant a poll appears during a PW.live class, live or
-recorded.
+[![License: MIT](https://img.shields.io/badge/license-MIT-4caf50.svg)](./LICENSE)
+[![Manifest V3](https://img.shields.io/badge/manifest-v3-blue.svg)](https://developer.chrome.com/docs/extensions/develop/migrate/what-is-mv3)
+[![Platform: Chrome](https://img.shields.io/badge/platform-Chrome-yellow.svg)](https://www.google.com/chrome/)
+[![Dependencies: none](https://img.shields.io/badge/dependencies-none-success.svg)](#tech-stack--architecture)
+[![Status: personal project](https://img.shields.io/badge/status-personal%20project-lightgrey.svg)](#)
 
-> **Unofficial project.** Not affiliated with, endorsed by, or connected
-> to Physics Wallah or PW.live in any way. Built by inspecting the
-> site's own public-facing markup and network traffic — it may break
-> whenever PW.live changes their site, since there's no official API
-> involved.
+> **Unofficial project.** Not affiliated with, endorsed by, or connected to Physics Wallah or PW.live. Built by inspecting the site's own public-facing markup and WebSocket traffic — no private API or reverse-engineered backend access is used, and it may break whenever PW.live changes their frontend.
 
-## Responsible use
+---
 
-This is meant for one specific case: you've already worked out the
-answer yourself, and you just want it submitted reliably and without
-delay once the poll opens — not to skip the problem entirely. Polls
-exist to check that you're actually following along; using this to
-answer things you haven't worked through defeats that purpose and isn't
-what this tool is for.
+## Why this project is worth a look
+
+This started as a small personal utility, but the engineering problem underneath it is a genuinely interesting one: **detect an asynchronous, third-party UI event (a poll opening on someone else's website) as close to zero-latency as possible, without an official API, without polling, and without breaking the host page.** A few of the decisions that came out of solving that:
+
+- **Event-driven over polling.** Instead of watching the DOM on a timer, the extension hooks the page's native `WebSocket` constructor at `document_start` (before the site's own scripts run) and listens for the platform's real `poll_start` / `stop_expiry` protocol frames — turning a guessing game into a deterministic trigger.
+- **Defense in depth.** A `MutationObserver`-based DOM fallback exists for the rare case the WebSocket signal is missed, so the feature degrades gracefully instead of failing silently.
+- **Correctness under concurrency.** The changelog documents real race conditions found and fixed during development — e.g. a stale-DOM-node check that could silently swallow a new poll's auto-open if the previous poll's container hadn't yet been removed, and a poll re-detection bug where an answered poll re-rendered by the site's framework could be mistaken for a brand-new one. Both are fixed with identity-based tracking (`pollId`) rather than DOM-shape heuristics.
+- **Zero build step, zero dependencies.** Every file in this repo is exactly what runs in the browser — no bundler, no transpiler, no npm install. That's a deliberate constraint, not an oversight: it keeps the entire trust boundary auditable in a single read-through (see [Privacy & security](#privacy--security)).
+- **Privacy by architecture, not by policy.** The extension makes zero network requests of its own — there is no `fetch` or `XMLHttpRequest` anywhere in the codebase — and the one thing it does read from the page (a WebSocket URL containing a session token) is redacted before it's used for anything, including debug logs.
+
+If you're skimming this as a recruiter or reviewer: the parts worth reading are [How it works internally](#how-it-works-internally) and the [Changelog](#changelog), which together show the debugging and design trail, not just the finished feature.
 
 ## Table of contents
 
-- [What it does](#what-it-does)
-- [Install](#install-unpacked-for-personal-use)
-- [How to use](#how-to-use)
-- [Settings popup](#settings-popup)
-- [Real-time poll detection](#real-time-poll-detection-websocket)
-- [Privacy](#privacy)
+- [Why this project is worth a look](#why-this-project-is-worth-a-look)
+- [Features](#features)
+- [Tech stack & architecture](#tech-stack--architecture)
+- [Installation](#installation)
+- [Usage](#usage)
+- [Settings](#settings)
+- [How it works internally](#how-it-works-internally)
+- [Privacy & security](#privacy--security)
+- [Responsible use](#responsible-use)
 - [Troubleshooting](#troubleshooting)
-- [How it works internally](#notes-on-how-it-works)
+- [Contributing](#contributing)
 - [Changelog](#changelog)
 - [License](#license)
 
-## What it does
+## Features
 
-Adds a small control docked next to the poll icon during **live**
-PW.live classes. Pre-select the answer you've worked out (A/B/C/D), and
-the moment a poll appears on screen, it selects that option and clicks
-Submit for you.
+- **Real-time poll detection** via a WebSocket hook on `wss://central-socket.penpencil.co`, not a fixed polling interval
+- **Sub-second auto-submit** of a pre-armed answer (A/B/C/D), with configurable delay (0–5s, 0.1s precision)
+- **Authoritative timing** — submission is capped against the poll's real server-reported deadline, not just the configured delay
+- **Animation-frame-synced UI** — the floating control tracks the real poll icon's live coordinates every frame instead of being inserted into the host page's own DOM tree, so it survives framework re-renders
+- **Auto-hide on inactivity**, mirroring native video-player control behavior
+- **Persistent settings** via `chrome.storage.local`, live-synced across the popup and in-page UI with no reload required
+- **Verbose, opt-in debug logging** for troubleshooting without editing code
 
-**Recorded classes aren't supported.** There's no reliable element to
-anchor the button to there, and after a few attempts at fallback
-positioning that didn't hold up across different page layouts, this was
-scoped back to live classes only rather than ship something
-half-working. See [Contributing](#contributing) if you want to take a
-crack at it.
+**Scope note:** this operates on **live classes only**. Recorded classes were deliberately descoped after several fallback-anchoring approaches failed to hold up across layouts — see [v2.7 in the changelog](#changelog) for the reasoning, and [Contributing](#contributing) if you want to take a crack at it.
 
-## Install (unpacked, for personal use)
+## Tech stack & architecture
 
-This isn't published on the Chrome Web Store — it's a personal-use,
-load-it-yourself extension.
+| | |
+|---|---|
+| **Language** | Vanilla JavaScript (ES2020+), no TypeScript build step |
+| **Platform** | Chrome Extension, Manifest V3 |
+| **Styling** | Hand-written CSS, custom properties for theming, no framework |
+| **Storage** | `chrome.storage.local` (device-local, never synced) |
+| **Dependencies** | None — no npm packages, no bundler, no CDN scripts |
+| **Size** | ~1,300 lines across `content.js`, `popup.js`, `websocket-hook.js` |
 
-1. Download or clone this repository
-2. Open Chrome and go to `chrome://extensions`
+```
+pw-poll-extension/
+├── manifest.json        # MV3 manifest — declares two content scripts and the storage permission
+├── websocket-hook.js     # Runs in the page's MAIN world at document_start; hooks WebSocket
+├── content.js            # Runs in the isolated world; owns UI injection, DOM detection, submission
+├── popup.js / popup.html / popup.css   # Extension toolbar settings panel
+├── overlay.css           # Styles for the in-page floating control
+└── icons/
+```
+
+**Data flow:**
+
+```
+PW.live page loads
+      │
+      ▼
+websocket-hook.js (MAIN world, document_start)
+      │  hooks the native WebSocket constructor before the site's socket opens
+      ▼
+Site opens wss://central-socket.penpencil.co/...
+      │  hook observes frames matching the poll_start / stop_expiry shape only
+      │  (session token stripped from the URL before any use, including logs)
+      ▼
+window.postMessage → content.js (isolated world)
+      │  cross-checks armed answer against the poll's real option list
+      │  computes submit timing against the poll's real expiry
+      ▼
+DOM: option selected → Submit clicked
+      │  (MutationObserver-based DOM color-change fallback if the socket event is missed)
+      ▼
+Status shown in the floating control / popup
+```
+
+Two content scripts run in two different execution contexts by design: `websocket-hook.js` needs the page's **main world** to see the native `WebSocket` object before the site's own bundle does; `content.js` stays in the extension's **isolated world**, per Chrome's security model, and the two talk to each other only via `window.postMessage`.
+
+## Installation
+
+Not published on the Chrome Web Store — this is a personal-use extension, loaded unpacked.
+
+1. **Clone the repository**
+   ```bash
+   git clone https://github.com/<your-username>/pw-poll-extension.git
+   ```
+2. Open Chrome and navigate to `chrome://extensions`
 3. Toggle on **Developer mode** (top right)
-4. Click **Load unpacked**
-5. Select this repository's folder
-6. Visit `pw.live` and open a class — the control appears within a few
-   seconds
+4. Click **Load unpacked** and select the cloned folder
+5. Open a **live** class on `pw.live` — the control appears next to the poll icon within a few seconds
 
-## How to use
+## Usage
 
-1. While solving the problem, click the checkmark icon to open the panel,
-   then click **A**, **B**, **C**, or **D** to mark your intended answer
-   (it turns green once armed). Clicking the same option again deselects
-   it.
-2. Keep "Auto-submit" checked to have it click Submit automatically —
-   this preference is remembered across page reloads.
-3. When the poll opens, your choice is selected (and submitted, if
-   auto-submit is on) immediately.
-4. Status messages in the panel tell you what happened — e.g. "Selected
-   'B'", "Submitted 'B' in 210ms", or a warning if something didn't
-   match.
+1. While solving the problem, click the checkmark icon to open the panel, then pick **A**, **B**, **C**, or **D** to mark your intended answer (it turns green once armed). Click the same option again to deselect it.
+2. Keep **Auto-submit** checked to have it click Submit automatically — this preference persists across reloads.
+3. When the poll opens, your choice is selected (and submitted, if auto-submit is on) immediately.
+4. Status messages in the panel report exactly what happened — e.g. `Selected 'B'`, `Submitted 'B' in 210ms`, or a warning if nothing matched.
 
-## Settings popup
+## Settings
 
-Click the extension's icon in Chrome's toolbar to open a settings panel:
+Click the extension's toolbar icon to open the settings popup:
 
 | Setting | What it does |
 |---|---|
-| **Auto-submit** | Click Submit automatically after your pre-chosen answer is selected. Synced with the in-page toggle. |
-| **Delay before submitting** | A slider (0–5s, 0.1s steps) plus a precise decimal-capable field (e.g. `1.2`) for exact control. Only controls when the *first* click attempt happens — if Submit isn't clickable yet, it checks every animation frame (not a slow fixed interval) until it is, up to a 2s timeout. The status message reports the real elapsed time so this is never a mystery. |
-| **Hide with video controls** | Fades the button out after ~3s of no mouse movement over the player, and back in the moment you move it — mirrors how native player controls behave. |
-| **Auto-open poll panel** | Opens the poll panel automatically when a poll becomes available, instead of waiting for it to pop up on its own. |
-| **Debug logging** | Verbose console output (F12), prefixed `[PW Poll Assist]`, for troubleshooting. |
+| **Auto-submit** | Clicks Submit automatically once the pre-chosen answer is selected. Synced with the in-page toggle. |
+| **Delay before submitting** | A slider (0–5s, 0.1s steps) plus a precise decimal field (e.g. `1.2`). Governs only when the *first* click attempt happens — if Submit isn't yet clickable, the extension re-checks every animation frame (not a fixed interval) until it is, up to a 2s timeout. The reported status always reflects real elapsed time. |
+| **Hide with video controls** | Fades the control out after ~3s of no mouse movement over the player, back in the moment you move it. |
+| **Auto-open poll panel** | Opens the poll panel automatically as soon as a poll becomes available, instead of waiting for the site's own animation. |
+| **Debug logging** | Verbose console output (`F12`), prefixed `[PW Poll Assist]`. |
 
-Changes take effect immediately on any open pw.live tab — no page reload
-needed.
+All changes apply immediately to any open `pw.live` tab — no reload required.
 
-## Real-time poll detection (WebSocket)
+## How it works internally
 
-Live classes connect to `wss://central-socket.penpencil.co/central-socket/ws`,
-which sends an unambiguous event the instant a poll starts:
+**Poll detection.** Live classes connect to `wss://central-socket.penpencil.co/central-socket/ws`, which emits an unambiguous event the instant a poll opens:
 
 ```
 poll {"operation":"start","pollId":"...","data":{"type":"SINGLE","pollOptions":[...],...},"event":"poll_start_v2_<scheduleId>"}
@@ -108,296 +146,99 @@ and a corresponding event as it's about to close:
 poll {"operation":"stop_expiry","pollId":"...","expiryDuration":19,...}
 ```
 
-`websocket-hook.js` runs inside the page's own JavaScript (before any
-WebSocket connections open) and forwards frames matching this exact
-shape to the extension, so it can open the poll panel the instant a
-**new** poll starts — reliably, for every poll in the class, not just
-the first. It never modifies or blocks any of the site's own traffic, it
-only observes, and it deliberately ignores everything else on that
-socket (chat, telemetry, etc.) — see [Privacy](#privacy).
+`websocket-hook.js` hooks the page's native `WebSocket` constructor **before any connections open**, and forwards only frames matching this exact shape to the extension — it never inspects, logs, or forwards chat messages, telemetry, or anything else on that socket, even though it technically could.
 
-This only covers **live** classes, which is the only context this
-extension operates in at all — see [What it does](#what-it-does). The
-edge-triggered color-change detection below exists as a fallback for
-this same live-class poll icon in case the WebSocket event is ever
-missed, not for recorded classes.
+**Selection & submission.** The `poll_start` payload carries the poll's real option labels and its real, authoritative deadline (`pollStartTime` + `expiryDuration`). Both are used directly: the armed answer is cross-checked against the real option list before any DOM search happens, and submission timing is capped to the poll's real remaining time rather than blindly trusting the configured delay. Options are matched by their **visible letter text** (not the input's `value` attribute, which isn't always present), and the button is clicked the same way a real user would.
 
-## Privacy
+**Resilience.** For the rare case the WebSocket signal is unavailable, a narrowly-scoped `MutationObserver` watches the poll icon's SVG fill color as a fallback trigger. The floating control itself is never inserted into PW.live's own DOM tree — it lives independently and recalculates its position from the real poll icon's live coordinates every animation frame, which avoids conflicts when the site's own framework re-renders the toolbar.
 
-- **No network calls of any kind.** The extension never sends anything
-  to any server — not analytics, not telemetry, nothing. There's no
-  `fetch`, `XMLHttpRequest`, or similar anywhere in the code.
-- **Settings never leave your device.** Stored in `chrome.storage.local`
-  (not `chrome.storage.sync`) — never synced to any account or cloud.
-- **Minimal permissions.** The manifest requests only `storage`. No
-  `tabs`, no `webRequest`, no host access beyond pw.live pages.
-- **The WebSocket hook only watches for one specific message shape** —
-  frames matching PW.live's actual poll-protocol format. It does not
-  inspect, log, or forward chat messages, other students' data, or
-  anything else on that socket, even though it technically could.
-- **Your session token is redacted before it's touched.** The WebSocket
-  URL contains your login token as a query parameter; it's stripped out
-  (replaced with `[redacted]`) before that URL is used for anything,
-  including debug logs.
-- **Debug logging is off by default** and only writes to your own local
-  browser console.
-- No build step, no minification — every file here is exactly what runs
-  in your browser, so you can verify all of the above yourself.
+## Privacy & security
+
+- **No network calls of any kind.** There is no `fetch`, `XMLHttpRequest`, or equivalent anywhere in the codebase — nothing is sent to any server, including analytics or telemetry.
+- **Settings never leave your device.** Stored in `chrome.storage.local` (not `chrome.storage.sync`) — never synced to any account or cloud.
+- **Minimal permissions.** The manifest requests only `storage`. No `tabs`, no `webRequest`, no host access beyond `pw.live` pages.
+- **Narrowly-scoped WebSocket observation.** The hook matches only the specific `poll {"operation":...}` frame shape — it does not read, log, or forward chat messages, other students' data, or anything else on that socket.
+- **Session token redaction.** The WebSocket URL contains a login token as a query parameter; it is stripped (`[redacted]`) before the URL is used for anything, including debug logs.
+- **Debug logging is off by default**, and even when enabled, only writes to your own local browser console.
+- **No build step, no minification.** Every file in this repository is exactly what runs in your browser, so every claim above is independently verifiable by reading the source.
+
+## Responsible use
+
+This is built for one specific case: you've already worked out the answer yourself and just want it submitted reliably and without delay once the poll opens — not to skip the problem entirely. Polls exist to check that you're following along; using this to answer things you haven't worked through defeats that purpose and isn't what this tool is for.
 
 ## Troubleshooting
 
-- **Button not appearing** — this extension only operates on live
-  classes (identified by the presence of the poll icon). Recorded
-  classes are out of scope — see [What it does](#what-it-does).
-- **Button not appearing/reappearing on live classes** — open the popup
-  and turn **off** "Hide with video controls" to keep it always visible
-  as a quick fix.
-- **No errors, but nothing happens** — open DevTools Console; warnings
-  prefixed `[PW Poll Assist]` usually mean PW.live's markup for that
-  particular poll differs from what the script expects.
-- **Want more detail** — turn on "Debug logging" in the popup for a
-  step-by-step console trace, no code editing or reload required.
-- **Option or Submit button not found** — grab the poll's HTML via
-  DevTools → Elements → right-click the poll → Copy → Copy outerHTML,
-  and update the matching logic in `findMatchingOptionButton` /
-  `findSubmitButton` in `content.js` to match the new structure. PRs
-  welcome if you fix something — see [Contributing](#contributing).
-
-## Notes on how it works
-
-- The WebSocket `poll_start` event carries the poll's real option labels
-  and its real, authoritative deadline (`pollStartTime` +
-  `expiryDuration`). These are used directly: the armed answer is
-  checked against the real option list before any DOM search happens,
-  and submission timing is capped to fit inside the real remaining time
-  rather than blindly trusting the configured delay.
-- The button fades based on real mouse movement over the detected player
-  area (or the button/dropdown itself), not by reading the site's
-  internal CSS state — an earlier approach that mirrored Video.js's
-  `vjs-user-active`/`vjs-user-inactive` classes proved unreliable and
-  could get the button stuck hidden.
-- For situations where the WebSocket signal is unavailable or missed, a
-  pending poll is also detected via the poll icon's SVG fill color
-  switching from white to the site's theme color — watched by a
-  narrowly-scoped `MutationObserver` on that one element for an instant,
-  cheap reaction.
-- The button is never inserted into PW.live's own DOM tree. It lives
-  independently and recalculates its position every animation frame from
-  the real poll icon's live coordinates — this avoids conflicts with the
-  site's own framework re-rendering the toolbar.
-- Poll options are matched by their **visible letter text**, not the
-  input's `value` attribute, since that attribute isn't always present.
-  The whole option button is clicked, same as a real user would.
-- The Submit button is searched for across the **whole page**, since
-  it's been observed living outside the poll's own DOM block.
+- **Control not appearing** — this extension only operates on live classes, identified by the presence of the poll icon; recorded classes are out of scope (see [Features](#features)).
+- **Control not appearing/reappearing** — open the popup and disable **Hide with video controls** to keep it always visible as a quick fix.
+- **No errors, but nothing happens** — open DevTools Console; warnings prefixed `[PW Poll Assist]` usually mean PW.live's markup for that particular poll differs from what the script expects.
+- **Want more detail** — enable **Debug logging** in the popup for a step-by-step console trace, no code editing or reload required.
+- **Option or Submit button not found** — grab the poll's HTML via DevTools → Elements → right-click the poll → Copy → Copy outerHTML, and update the matching logic in `findMatchingOptionButton` / `findSubmitButton` in `content.js`. PRs welcome — see [Contributing](#contributing).
 
 ## Contributing
 
-Issues and pull requests are welcome, especially if PW.live changes
-their markup or protocol and something here breaks. A good bug report
-includes the relevant DOM snippet or console output — see
-[Troubleshooting](#troubleshooting) for how to grab those.
+Issues and pull requests are welcome, especially if PW.live changes their markup or WebSocket protocol and something here breaks. A good bug report includes the relevant DOM snippet or console output — see [Troubleshooting](#troubleshooting) for how to capture those.
 
 ## Changelog
 
 <details>
-<summary>Click to expand version history</summary>
+<summary><strong>Click to expand full version history (v1.0 → v3.3)</strong></summary>
 
 **v3.3**
-- Rebuilt the "Delay before submitting" slider from a bare native input
-  into a fully custom-styled control: the track now visually fills in
-  the accent color up to the current value (the standard technique
-  behind every polished slider you've used — CSS has no native concept
-  of "filled to here" on a range input, so this is kept in sync via a
-  `--pct` custom property updated in JS), the thumb is larger with a
-  soft glow ring and grows slightly on hover/press with spring easing,
-  and the live value readout next to it is now a proper "spec chip"
-  (fused number + unit, subtle inset border) instead of a plain text
-  box.
+- Rebuilt the "Delay before submitting" slider from a bare native input into a fully custom-styled control: the track visually fills in the accent color up to the current value (kept in sync via a `--pct` custom property updated in JS, since CSS has no native concept of "filled to here" on a range input), the thumb has a soft glow ring and grows on hover/press with spring easing, and the live value readout is a proper "spec chip" instead of a plain text box.
 
 **v3.2**
-- Premium polish pass on both surfaces (popup and in-page dropdown):
-  - Proper easing curves throughout instead of default linear/ease
-    transitions — a smooth deceleration curve for color/background
-    changes, a spring curve (slight overshoot) specifically on the
-    toggle switches for a tactile, iOS-style snap
-  - Translucent "glass" card surfaces with a subtle top edge highlight
-    and soft drop shadow, instead of flat fills — the classic technique
-    premium dark UIs (Linear, Raycast, Arc) use for depth
-  - A radial accent glow behind the popup header icon, and matching glow
-    on the toggle switches and option buttons when active
-  - Hover feedback on every interactive row/button, not just the
-    obviously clickable elements
-  - Tighter letter-spacing and more deliberate type hierarchy
-  - Went back to a dark, cohesive design for both surfaces (v3.1's light
-    popup didn't land well — it read as a generic flat settings panel
-    rather than feeling more refined)
+- Premium polish pass on both surfaces (popup and in-page dropdown): proper easing curves (smooth deceleration for color/background changes, a spring curve on toggle switches for a tactile snap), translucent "glass" card surfaces with a subtle top-edge highlight and soft drop shadow, a radial accent glow behind the popup header icon and active toggles, hover feedback on every interactive row, and tighter, more deliberate type hierarchy. Reverted to a dark, cohesive design after v3.1's light popup read as a generic flat settings panel.
 
 **v3.1**
-- Redesigned the popup: light, neutral surface instead of the previous
-  dark-with-bright-green treatment (a combination common enough in
-  AI-generated UI to be worth deliberately avoiding) — closer to how
-  well-regarded browser extension settings panels actually look. Removed
-  the static "Watching for polls" banner, since it didn't reflect real
-  state and didn't earn its space. Row dividers are now handled via CSS
-  instead of extra markup for each one.
-- Refined the accent color on both surfaces from a generic, bright
-  Material Design green to a deeper, more considered jade — still
-  grounded in the product's own checkmark/correct-answer motif, just
-  less templated-looking.
-- The in-page dropdown deliberately stays dark, since it sits directly
-  beside PW.live's own dark video-player controls — a contextual choice
-  rather than a default, unlike the popup which is its own standalone
-  surface.
-- The in-page "selected option" state changed from a solid filled button
-  to a softer accent-tinted style, less visually loud.
+- Redesigned the popup with a lighter, more neutral surface; removed the static "Watching for polls" banner since it didn't reflect real state; refined the accent from a generic Material green to a deeper jade, still grounded in the product's own checkmark motif.
 
 **v3.0**
-- Housekeeping pass, no functional changes to detection/submission
-  behavior:
-  - The version badge (popup and in-page dropdown) is now read directly
-    from the manifest at runtime instead of being a hardcoded string
-    duplicated in three separate places — which had already drifted out
-    of sync at least once during development. Bumping the version now
-    only requires updating `manifest.json`.
-  - Removed a genuine code duplication bug: two nearly-identical
-    functions (`setArmedVisual` / `setArmedVisual2`) existed only
-    because of a variable-assignment ordering issue. Consolidated into
-    one.
-  - Fixed stale documentation: the file header comment still described
-    the recorded-class/floating-position behavior removed in v2.7.
-  - Fixed malformed comment formatting left over from an earlier edit.
+- Housekeeping: version badge now read from `manifest.json` at runtime instead of being hardcoded in three places; removed a real code-duplication bug (`setArmedVisual` / `setArmedVisual2`, an artifact of a variable-assignment ordering issue); fixed stale documentation and malformed comments.
 
 **v2.9**
-- **Fixed a real bug likely behind several reported symptoms at once**:
-  the "don't click if a poll panel looks already open" safeguard added
-  in v2.5 was checked using a loose "does *any* poll-shaped DOM node
-  exist" test, with no concept of *which* poll. If the previous poll's
-  container lingered in the DOM for even a moment (e.g. showing a brief
-  results state) right as a new poll's start event arrived, this made
-  the new poll's auto-open silently no-op. Removed that check from the
-  WebSocket-triggered path entirely — it already has a far stronger,
-  precise guard (`handledPollStartIds`, keyed to the poll's actual
-  unique ID), making the DOM-presence check both redundant and a source
-  of false positives there. It remains in place for the separate
-  DOM-color-based fallback, where no such strong identity exists.
-- **Fixed a distinct bug**: an already-answered poll's container could
-  be re-detected as a brand new poll if the site re-renders it into a
-  results/confirmation view using a different DOM node. Now tracks which
-  poll IDs have actually been answered (durable, identity-based — not
-  tied to any specific DOM node reference) and skips re-processing.
-- Poll selection now cross-checks the armed answer against the poll's
-  *real* option list (from the WebSocket `poll_start` payload) before
-  touching the DOM at all, and submission timing now respects the poll's
-  *real* authoritative deadline (`pollStartTime` + `expiryDuration`),
-  shortening the configured delay if it would otherwise run past when
-  the poll actually closes — using the site's own confirmed data rather
-  than assumptions.
-- Shortened the initial "is this a live class" grace period from 4s to
-  2.5s for a snappier first load.
+- **Fixed a real bug behind several reported symptoms**: the "don't click if a poll panel looks already open" safeguard was checked with a loose "does *any* poll-shaped DOM node exist" test with no concept of *which* poll — if the previous poll's container lingered even briefly, a new poll's auto-open would silently no-op. Removed in favor of the existing identity-based guard (`handledPollStartIds`).
+- **Fixed a distinct bug**: an already-answered poll's container could be re-detected as a brand-new poll if the site re-rendered it into a results view using a different DOM node. Now tracks answered poll IDs directly rather than DOM node references.
+- Poll selection now cross-checks the armed answer against the poll's real option list from the WebSocket payload before touching the DOM, and submission timing respects the poll's real authoritative deadline.
 
 **v2.8**
-- Fixed a flicker bug: the button and dropdown were being torn down and
-  rebuilt from scratch whenever `#poll-icon` was momentarily absent for
-  even a single check — which happens routinely when the site's own
-  framework re-renders the toolbar. The "is this a live class" detection
-  is now sticky: once the icon has been seen once, a transient absence
-  is ignored rather than triggering teardown.
-- Fixed a stale-answer bug: if selecting an option or clicking Submit
-  ever timed out, the armed answer was never cleared. If a different,
-  unrelated poll then appeared and you forgot to pick a new answer, the
-  old selection could have been silently applied to it. All failure
-  paths now clear the selection, matching the successful-submit
-  behavior.
-- Reduced CPU work during the submit-wait window: checking whether
-  Submit has become clickable no longer re-scans every button on the
-  entire page on every animation frame — it caches the located button
-  once found and just re-checks its `disabled` state directly.
-- Fixed pressing Space while the button is focused also scrolling the
-  page (missing `preventDefault`).
+- Fixed a flicker bug: the control was torn down and rebuilt whenever `#poll-icon` was momentarily absent for a single check (routine during framework re-renders) — "is this a live class" detection is now sticky. Fixed a stale-answer bug where a failed select/submit never cleared the armed selection. Reduced CPU work in the submit-wait loop by caching the located button instead of re-scanning the page every frame. Fixed Space-bar also scrolling the page while the control was focused.
 
 **v2.7**
-- Removed recorded-class support entirely rather than leaving it as an
-  opt-in toggle. There's no reliable element to anchor the button to on
-  recorded-class pages, and several rounds of fallback-selector attempts
-  didn't hold up across different page layouts. The extension now scopes
-  itself to live classes only (detected via the presence of the poll
-  icon) — cleaner and more honest than a feature that only sometimes
-  worked.
+- Removed recorded-class support entirely rather than leaving it as a half-working opt-in — no reliable anchor element exists on recorded-class pages, and several rounds of fallback selectors didn't hold up across layouts.
 
 **v2.6**
-- (Superseded by v2.7) Added an "Enable on recorded classes" setting,
-  off by default, as an interim step before removing the feature
-  outright.
+- (Superseded by v2.7) Added an "Enable on recorded classes" setting, off by default, as an interim step before removing the feature outright.
 
 **v2.5**
-- Smoother, lower-latency submission: option-selection and Submit-button
-  readiness are now checked every animation frame instead of on a fixed
-  200ms interval, cutting worst-case detection latency substantially
-- Option selection now retries for up to 800ms if the poll's option
-  buttons haven't rendered yet at the first look, instead of giving up
-  immediately
-- Added a safeguard so auto-open (both the WebSocket-triggered and
-  DOM-fallback paths) never clicks the poll icon while a poll panel is
-  already open — previously a duplicate "start" event or a race between
-  detection paths could have toggled an open panel closed
-- The main detection loop now coalesces multiple rapid page mutations
-  into a single check per animation frame instead of re-scanning the
-  whole page on every individual DOM change, reducing overhead on busy
-  pages without any loss of responsiveness
+- Option-selection and Submit-readiness checks moved from a fixed 200ms interval to every animation frame. Option selection now retries for up to 800ms if buttons haven't rendered yet. Added a guard so auto-open never closes an already-open poll panel. Rapid DOM mutations are now coalesced into one check per frame.
 
 **v2.4**
-- Fixed the recorded-class button position: it was falling back to a
-  fixed corner of the whole page, which could land outside the actual
-  video player depending on page layout. It now anchors to the real
-  player/toolbar element (`#footer-right-section` /
-  `#video-player-container` / `.video-player-app`) and pins to its right
-  edge, vertically centered — the same relative spot it sits in next to
-  the real poll icon in live classes.
+- Fixed the recorded-class button position anchoring to a fixed page corner instead of the real player/toolbar element.
 
 **v2.3**
-- Privacy hardening: the WebSocket hook now matches only the specific
-  `poll {"operation":...}` frame shape instead of a loose "mentions
-  poll" filter. Session auth token is now redacted before use anywhere,
-  including debug logs. Added the Privacy section.
+- Privacy hardening: WebSocket hook now matches the specific `poll {"operation":...}` frame shape instead of a loose "mentions poll" filter; session token redacted before any use, including logs.
 
 **v2.2**
-- Delay slider now works in seconds (0–5s, 0.1s steps) instead of
-  milliseconds, plus a precise decimal-capable number field (e.g. `1.2`)
-- Submitted status now shows real elapsed time and attempt count, since
-  actual submit time can run longer than the configured delay if the
-  retry loop kicks in
+- Delay slider now works in seconds (0–5s, 0.1s steps) with a precise decimal field. Submitted status now shows real elapsed time and attempt count.
 
 **v2.1**
-- Confirmed the real poll protocol: live classes send `poll
-  {"operation":"start",...}` over WebSocket the instant a poll begins,
-  and `stop_expiry` as it's about to close. Auto-open now triggers off
-  this event directly for live classes — reliable for every poll, not
-  just the first.
+- Confirmed the real poll protocol (`poll_start` / `stop_expiry` over WebSocket); auto-open now triggers directly off this event for live classes.
 
 **v2.0**
-- Visual redesign: proper extension icon, polished popup and in-page
-  dropdown UI, animated toggle switches, color-coded status indicator
-- WebSocket instrumentation added to help identify the site's real
-  "poll started" event
-- Fixed a bug where "hide with video controls" could get permanently
-  stuck if it latched onto the wrong player element
-- Auto-open poll panel is now edge-triggered off the poll icon's color
-  change, instead of polling on a blind timer
+- Visual redesign with a proper extension icon, animated toggles, and color-coded status. WebSocket instrumentation added. Fixed a "hide with video controls" bug that could get permanently stuck. Auto-open switched from a blind timer to edge-triggered detection off the poll icon's color change.
 
 **v1.1**
-- Added settings popup (auto-submit toggle, submit delay slider, debug
-  logging) backed by `chrome.storage`, synced live with the page
-- Decoupled the button from the site's own DOM tree, fixing a bug where
-  it would get left behind when the site's framework re-rendered the
-  toolbar
+- Added the settings popup (auto-submit, delay slider, debug logging) backed by `chrome.storage`, live-synced with the page. Decoupled the control from the site's DOM tree, fixing a bug where it was left behind on framework re-renders.
 
 **v1.0**
-- Initial release: pre-select an answer, auto-detect the poll,
-  auto-submit
+- Initial release: pre-select an answer, auto-detect the poll, auto-submit.
 
 </details>
 
 ## License
 
 MIT — see [LICENSE](./LICENSE).
+
+---
+
+*Built as a personal project to solve a real, specific latency problem — and to get comfortable with Manifest V3's execution-world model, WebSocket interception, and defensive DOM programming along the way. Feedback and PRs welcome.*
