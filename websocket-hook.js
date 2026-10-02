@@ -56,24 +56,9 @@
     }
   }
 
-  function forward(direction, url, data) {
+  function post(direction, url, text) {
     try {
-      let text = null;
-      if (typeof data === "string") {
-        text = data;
-      } else if (data instanceof ArrayBuffer) {
-        try {
-          text = new TextDecoder("utf-8").decode(data);
-        } catch (_e) {
-          text = null;
-        }
-      } else {
-        // Blob payloads would need async reading — skip; PW.live's poll
-        // protocol frames observed so far are plain text, not Blobs.
-        return;
-      }
       if (!text || !POLL_FRAME_PATTERN.test(text)) return;
-
       window.postMessage(
         {
           __pwPollAssistWS: true,
@@ -84,6 +69,37 @@
         },
         "*"
       );
+    } catch (_err) {
+      // Never let instrumentation errors affect the page's real socket.
+    }
+  }
+
+  function forward(direction, url, data) {
+    try {
+      if (typeof data === "string") {
+        post(direction, url, data);
+      } else if (data instanceof ArrayBuffer) {
+        let text = null;
+        try {
+          text = new TextDecoder("utf-8").decode(data);
+        } catch (_e) {
+          text = null;
+        }
+        post(direction, url, text);
+      } else if (typeof Blob !== "undefined" && data instanceof Blob) {
+        // WebSocket.binaryType defaults to "blob", so a site that never
+        // changes it delivers every binary frame as a Blob — which used to be
+        // dropped here, silently disabling real-time detection. Reading a
+        // Blob is async, and to keep the privacy posture above intact only
+        // its first few bytes are read to apply the same `poll {` filter;
+        // the rest is read only if that prefix matches.
+        data
+          .slice(0, 16)
+          .text()
+          .then((head) => (POLL_FRAME_PATTERN.test(head) ? data.text() : null))
+          .then((text) => post(direction, url, text))
+          .catch(() => {});
+      }
     } catch (_err) {
       // Never let instrumentation errors affect the page's real socket.
     }

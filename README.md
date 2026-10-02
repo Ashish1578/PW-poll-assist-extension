@@ -39,7 +39,7 @@ Not published on the Chrome Web Store — you load it directly from this repo.
 
 1. While solving the problem, click the checkmark icon to open the panel, then click **A**, **B**, **C**, or **D** to mark your intended answer — it turns green once armed. Click the same option again to deselect it.
 2. Keep **Auto-submit** checked to have it click Submit automatically. This preference is remembered across page reloads.
-3. When the poll opens, your choice is selected (and submitted, if auto-submit is on) immediately.
+3. When the poll opens, your choice is selected (and submitted, if auto-submit is on) immediately. If a poll is *already running* when you pick an answer, it's opened and answered right away instead of waiting for the next one.
 4. A status message in the panel tells you what happened — e.g. "Selected 'B'", "Submitted 'B' in 210ms", or a warning if something didn't match.
 
 **Note:** this only works on **live** classes, not recorded ones.
@@ -51,9 +51,9 @@ Click the extension's icon in Chrome's toolbar to open the settings panel:
 | Setting | What it does |
 |---|---|
 | **Auto-submit** | Clicks Submit automatically once your pre-chosen answer is selected. Synced with the in-page toggle. |
-| **Delay before submitting** | A slider (0–5s) plus a precise field for exact control over when it clicks Submit. |
+| **Delay before submitting** | A slider (0–5s) plus a precise field for exact control over when it clicks Submit. **0 means no added delay**: Submit is clicked as soon as the page has marked your option (the page needs a moment to register the click, so Submit is never sent before it). Any other value is honored exactly, counted from the moment the option is selected. |
 | **Hide with video controls** | Fades the button out after a few seconds of no mouse movement, and back in when you move it — like the video player's own controls. |
-| **Auto-open poll panel** | Opens the poll panel automatically as soon as a poll becomes available. |
+| **Auto-open poll panel** | Opens the poll panel automatically as soon as a poll becomes available. It only ever clicks the poll icon when the poll isn't already showing, and never fights you if you open or close the panel yourself. If you turn this off, arming an answer won't open the panel either — it answers as soon as you open it. |
 | **Debug logging** | Verbose console output (F12), for troubleshooting. |
 
 Changes apply immediately — no page reload needed.
@@ -86,6 +86,8 @@ Issues and pull requests are welcome, especially if PW.live changes something an
 
 <details>
 <summary>Click to expand version history</summary>
+
+**v3.5.2** — Fixed the poll panel sometimes not opening, or closing itself, when a poll started — especially when it was already open, or when one poll followed another. Picking an answer while a poll is already running now opens and answers it straight away. Also fixed: clicking the wrong "Submit" button on pages that have more than one; polls being skipped as "already expired" when your computer's clock was off; a deselected or changed answer still being submitted after the delay (and the status saying `Submitted "null"`); an answer staying armed for the next poll when auto-submit is off; Poll Assist stopping for good after cancelling a "Leave site?" prompt; and polls not being answered while the class tab was in the background. Much lower CPU use on busy pages. No delays are added anywhere: the only wait is the one you set, and with it at 0 Submit follows the moment the page has marked your option. Submit is never clicked before the page has registered the option, and if a page clears your selection right after it is made, it is selected again.
 
 **v3.3** — Redesigned the delay slider with a smoother, more precise look and feel.
 

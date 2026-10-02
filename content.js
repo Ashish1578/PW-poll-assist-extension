@@ -31,6 +31,26 @@
  *   (see "WebSocket-driven poll detection" near the bottom of this
  *   file) — DOM/color-based detection exists only as a fallback for
  *   when that event is ever missed.
+ * - The site's poll icon is a *toggle* (click = open, click again = close),
+ *   so clicking it blindly is dangerous. Each poll is therefore handled by
+ *   ONE "session" driven by ONE loop (see "Poll session"), and the only
+ *   place the icon is ever clicked automatically is maybeOpenPanel(): only
+ *   when no poll UI is visible (after one browser-task yield, not a timer),
+ *   never right
+ *   after the user touched the icon themselves, and rate-limited across
+ *   every trigger (WebSocket event, icon color change, arming an answer).
+ * - A poll's deadline is measured from when the event was *received*, not
+ *   from the payload's server-side pollStartTime: client clocks drift, and
+ *   trusting the server timestamp made polls look "already expired".
+ * - No delay of its own is ever added: the only wait a user can hit is their
+ *   own "Delay before submitting" (0 means 0). Work is triggered by DOM
+ *   changes, and there are no timers on the happy path. Two things are
+ *   waited for, each only for as long as the page itself takes: one browser
+ *   task before the first icon click (so the site can finish rendering the
+ *   poll it just received), and the page's own reaction to the option click
+ *   (Submit must never land before the option is marked — see "confirm").
+ * - Time-critical steps use nextFrame(): requestAnimationFrame with a timer
+ *   fallback, because rAF never fires while the class tab is in the background.
  * - If PW.live changes its markup further, the things most likely to
  *   need updating are POLL_HEADING_MATCH and the button-matching logic
  *   in findMatchingOptionButton / findSubmitButton.
@@ -47,7 +67,19 @@
     POLL_HEADING_MATCH: "choice poll", // lowercase substring match against heading text
     ICON_SIZE: 40,
     DOCK_GAP: 8, // px gap between our icon and the real poll icon
-    AUTO_OPEN_RETRY_MS: 1200, // cooldown between click retries while a poll is pending but not yet open
+    AUTO_OPEN_RETRY_MS: 250, // floor between ANY two clicks we make on the poll icon (it is a toggle); only stops two triggers firing in the same instant
+    OPEN_HOLD_MS: 1000, // most we hold off opening the panel while the PREVIOUS poll's UI is still on screen and unchanged (i.e. it's evidently open)
+    OPEN_VERIFY_MS: 1200, // after our click, how long to wait for the poll to show up before a single retry
+    MAX_OPEN_CLICKS: 2, // per poll: the 2nd click only ever happens for an armed answer whose panel still didn't show up
+    STALE_UI_TIMEOUT_MS: 400, // longest an on-screen UI that is state-for-state identical to the PREVIOUS poll's is treated as "old" rather than the new poll
+    SELECTION_CONFIRM_MS: 200, // most we wait for the page to visibly register a clicked option before clicking Submit anyway (normally it's a few ms)
+    SUBMIT_SAFETY_MARGIN_MS: 300, // leave this much of the poll's real window for the click itself to land
+    POLL_END_GRACE_MS: 1500, // keep working this long past the reported expiry (latency / clock slop) before giving up
+    UNKNOWN_POLL_WINDOW_MS: 60000, // window to assume when a poll is detected without WebSocket timing info
+    SIGNAL_MERGE_MS: 4000, // the icon color change and the WS "start" frame within this window are the same poll
+    POST_POLL_QUIET_MS: 1500, // after a poll ends, ignore DOM-only "new poll" detection this long (results views reuse the poll markup)
+    SCAN_INTERVAL_MS: 0, // 0 = look at the DOM on every step. Scanning is cheap; any throttle would just be added latency
+    BACKGROUND_TICK_MS: 120, // timer fallback for when requestAnimationFrame is paused (background tab)
   };
 
   // ================= User settings (editable via the extension popup) =================
@@ -121,22 +153,11 @@
 
   // ================= State =================
   let selectedOption = null; // "A" | "B" | "C" | "D" | null
-  // Real metadata from the confirmed WebSocket poll_start payload, e.g.:
-  //   {"operation":"start","pollId":"...","data":{"type":"SINGLE",
-  //    "expiryDuration":30,"pollStartTime":1788411108,
-  //    "pollOptions":[{"optionLabel":"A",...}, ...]}}
-  // Captured once per poll and used to make detection/submission
-  // decisions based on the site's own authoritative data instead of
-  // assumptions — cleared whenever the corresponding DOM poll container
-  // disappears (see watchForPollGone) so it can never bleed into a
-  // later poll if a future "start" event were ever missed.
-  let currentPollMeta = null;
-  let lastHandledPollNode = null;
+  let armedAt = 0; // when selectedOption was last armed (ms epoch) — tells "meant for this poll" from "meant for the next one"
   let answerWrapRef = null;
   let dropdownRef = null;
   let iconRef = null;
   let observer = null;
-  let pollGoneIntervalId = null;
   let injectPollId = null;
   let trackingRafId = null;
   const scriptStartTime = Date.now();
@@ -267,6 +288,8 @@
         dropdown._pwSetStatus(`Ready — "${selectedOption}" will be submitted when the poll opens.`, "ready");
         setArmedVisual(true);
         log("Option armed:", selectedOption);
+        // If a poll is already running, pick it up right now instead of waiting for the next one.
+        onAnswerArmed();
       });
     });
 
@@ -294,6 +317,7 @@
 
   function resetSelectionAfterPoll() {
     selectedOption = null;
+    armedAt = 0;
     setArmedVisual(false);
     if (dropdownRef) {
       dropdownRef.querySelectorAll(".pw-opt-btn").forEach((b) => {
@@ -443,6 +467,9 @@
 
   // ================= Global UI event wiring (once) =================
   document.addEventListener("click", (e) => {
+    // Ignore the clicks this script makes itself (poll icon / option / submit) —
+    // otherwise every auto-open would slam the panel shut while you're using it.
+    if (!e.isTrusted) return;
     if (!dropdownRef) return;
     if (answerWrapRef && answerWrapRef.contains(e.target)) return;
     if (dropdownRef.contains(e.target)) return;
@@ -454,18 +481,44 @@
   });
 
   // ================= Poll detection =================
+  // Only a *visible* match counts. A closed panel that the site keeps
+  // mounted (display:none) is not "an open poll" — treating it as one made
+  // the old code believe the panel was open and skip opening it.
+  function isVisible(el) {
+    try {
+      return !!el && el.isConnected && el.getClientRects().length > 0;
+    } catch (_e) {
+      return false;
+    }
+  }
+
+  function isOwnUi(el) {
+    return !!((dropdownRef && dropdownRef.contains(el)) || (answerWrapRef && answerWrapRef.contains(el)));
+  }
+
+  function containsPollHeading(node) {
+    const spans = node.querySelectorAll("span");
+    for (const sp of spans) {
+      const t = sp.textContent;
+      if (t && t.toLowerCase().includes(CONFIG.POLL_HEADING_MATCH)) return true;
+    }
+    return false;
+  }
+
+  // The poll UI = the smallest element holding both the heading ("... Choice
+  // Poll") and its radio inputs. Starting from the radios makes the common
+  // case (no poll on screen) a single cheap query instead of a scan of every
+  // <span> on the page.
   function findPollContainer() {
     try {
-      const spans = document.querySelectorAll("span");
-      for (const h of spans) {
-        const text = h.textContent && h.textContent.trim().toLowerCase();
-        if (text && text.includes(CONFIG.POLL_HEADING_MATCH)) {
-          let node = h;
-          for (let i = 0; i < 8 && node; i++) {
-            if (node.querySelectorAll && node.querySelectorAll('input[type="radio"]').length > 0) {
-              return node;
-            }
-            node = node.parentElement;
+      const radios = document.querySelectorAll('input[type="radio"]');
+      if (radios.length === 0) return null;
+      for (const radio of radios) {
+        let node = radio.parentElement;
+        for (let i = 0; i < 12 && node && node !== document.body; i++, node = node.parentElement) {
+          if (containsPollHeading(node)) {
+            if (isVisible(node)) return node;
+            break; // heading found, but this poll UI is hidden — try the next radio
           }
         }
       }
@@ -475,17 +528,80 @@
     return null;
   }
 
-  function findMatchingOptionButton(container, letter) {
-    if (!letter) return null;
+  // A short text fingerprint of the poll UI, used to tell "the previous
+  // poll's leftover UI" apart from "the new poll's UI" (see isLeftoverUi).
+  function uiSignature(node) {
     try {
-      const buttons = container.querySelectorAll("button");
-      for (const btn of buttons) {
-        const spans = btn.querySelectorAll("span");
-        for (const s of spans) {
-          if (s.textContent && s.textContent.trim().toUpperCase() === letter.toUpperCase()) {
-            return btn;
-          }
-        }
+      let sig = (node.textContent || "").replace(/\s+/g, " ").trim().slice(0, 400);
+      // Text alone isn't enough: consecutive polls often have identical text
+      // (just "A B C D"). What tells a fresh UI from a used one is its
+      // *state* — enabled vs disabled, selected vs not.
+      let n = 0;
+      for (const el of node.querySelectorAll("button, input")) {
+        if (++n > 40) break;
+        const selected =
+          el.checked === true ||
+          el.getAttribute("aria-pressed") === "true" ||
+          el.getAttribute("aria-checked") === "true" ||
+          el.getAttribute("aria-selected") === "true";
+        sig += (el.disabled || el.getAttribute("aria-disabled") === "true" ? "|d" : "|e") + (selected ? "s" : "-");
+      }
+      return sig;
+    } catch (_e) {
+      return "";
+    }
+  }
+
+  // Re-scanning the DOM every frame is wasteful; rescan when the DOM changed
+  // (MutationObserver sets domDirty) or every SCAN_INTERVAL_MS otherwise
+  // (covers pure style changes, e.g. display:none -> block, that don't
+  // add/remove nodes).
+  let domDirty = true;
+  let scanCache = { at: 0, node: null };
+  function currentPollContainer() {
+    const now = Date.now();
+    const cached = scanCache.node;
+    if (!domDirty && now - scanCache.at < CONFIG.SCAN_INTERVAL_MS && (!cached || isVisible(cached))) {
+      return cached;
+    }
+    scanCache = { at: now, node: findPollContainer() };
+    domDirty = false;
+    return scanCache.node;
+  }
+
+  function isOptionButton(btn, letter) {
+    const want = letter ? letter.toUpperCase() : null;
+    for (const s of btn.querySelectorAll("span")) {
+      const t = s.textContent && s.textContent.trim().toUpperCase();
+      if (!t) continue;
+      if (want ? t === want : /^[A-D]$/.test(t)) return true;
+    }
+    return false;
+  }
+
+  // true / false when the page reports whether this option is selected, null
+  // when it doesn't say (so we never guess).
+  function isOptionSelected(btn) {
+    try {
+      const radio = btn.querySelector('input[type="radio"]');
+      if (radio) return !!radio.checked;
+      for (const attr of ["aria-pressed", "aria-checked", "aria-selected"]) {
+        const v = btn.getAttribute(attr);
+        if (v === "true") return true;
+        if (v === "false") return false;
+      }
+    } catch (_e) {
+      // fall through
+    }
+    return null;
+  }
+
+  function findMatchingOptionButton(container, letter) {
+    if (!container || !letter) return null;
+    try {
+      for (const btn of container.querySelectorAll("button")) {
+        if (btn.disabled || btn.getAttribute("aria-disabled") === "true") continue;
+        if (isOptionButton(btn, letter)) return btn;
       }
     } catch (err) {
       logError("findMatchingOptionButton failed", err);
@@ -493,233 +609,628 @@
     return null;
   }
 
-  // Same caching idea as makeSubmitButtonFinder — avoids re-scanning the
-  // poll container's buttons on every animation frame once the target
-  // option button has already been located once.
-  function makeOptionButtonFinder(container, letter) {
-    let cached = null;
-    return function findOptionButtonCached() {
-      if (cached && document.body.contains(cached)) return cached;
-      cached = findMatchingOptionButton(container, letter);
-      return cached;
-    };
+  function hasOptionButtons(container) {
+    try {
+      for (const btn of container.querySelectorAll("button")) {
+        if (!btn.disabled && isOptionButton(btn, null)) return true;
+      }
+    } catch (err) {
+      logError("hasOptionButtons failed", err);
+    }
+    return false;
   }
 
-  function findSubmitButton() {
+  // The Submit button has been observed outside the poll's own subtree, so
+  // it can't be looked up strictly inside the container — but "the first
+  // button on the whole page containing 'submit'" also picks up unrelated
+  // ones ("Submit feedback", a doubt/rating form, ...). So: the closest
+  // scope around the poll wins, an exact "Submit" beats a longer label, and
+  // far-away buttons are only accepted when the label is exactly "Submit".
+  // Without the poll on screen there is nothing to anchor to, so no guess is
+  // made at all — a wrong click on some unrelated Submit is worse than a
+  // clear "couldn't find Submit" warning.
+  function findSubmitButton(container) {
+    if (!container) return null;
     try {
-      const buttons = document.querySelectorAll("button");
-      for (const b of buttons) {
-        if (b.textContent && b.textContent.trim().toLowerCase().includes("submit")) {
-          return b;
-        }
+      const cands = [];
+      for (const b of document.querySelectorAll("button")) {
+        if (isOwnUi(b)) continue;
+        const t = (b.textContent || "").trim().toLowerCase();
+        if (!t.includes("submit") || !isVisible(b)) continue;
+        cands.push({ b, rank: t === "submit" ? 0 : t.startsWith("submit") ? 1 : 2 });
       }
+      if (cands.length === 0) return null;
+
+      let scope = container;
+      for (let i = 0; i < 6 && scope && scope !== document.body; i++, scope = scope.parentElement) {
+        const inScope = cands.filter((c) => scope.contains(c.b));
+        if (inScope.length) return inScope.reduce((best, c) => (c.rank < best.rank ? c : best)).b;
+      }
+      const exact = cands.filter((c) => c.rank === 0);
+      return exact.length ? exact[0].b : null;
     } catch (err) {
       logError("findSubmitButton failed", err);
     }
     return null;
   }
 
-  // Wraps findSubmitButton() with a cache: once the button element is
-  // located, subsequent checks just read its .disabled property directly
-  // instead of re-scanning every button on the page on every animation
-  // frame for up to SUBMIT_TIMEOUT_MS. Falls back to a fresh scan if the
-  // cached element ever gets removed from the page.
-  function makeSubmitButtonFinder() {
-    let cached = null;
-    return function findSubmitButtonCached() {
-      if (cached && document.body.contains(cached)) {
-        return !cached.disabled ? cached : null;
-      }
-      cached = findSubmitButton();
-      return cached && !cached.disabled ? cached : null;
+  // Does this look like a poll you can vote in right now (as opposed to a
+  // results / "answer recorded" view that reuses the same heading)?
+  function looksLikeLiveVote(container) {
+    return hasOptionButtons(container) && !!findSubmitButton(container);
+  }
+
+  // ================= Scheduling =================
+  // requestAnimationFrame never fires in a background tab, and a live class
+  // is very often left in one. Every time-critical step therefore also has a
+  // timer fallback (timers keep running, just throttled) — whichever fires
+  // first runs the callback, the other is a no-op.
+  function nextFrame(fn) {
+    let fired = false;
+    let timer = 0;
+    const run = () => {
+      if (fired) return;
+      fired = true;
+      clearTimeout(timer);
+      fn();
     };
+    requestAnimationFrame(run);
+    timer = setTimeout(run, CONFIG.BACKGROUND_TICK_MS);
   }
 
-  // Generic rAF-driven polling helper: checks `checkFn()` every animation
-  // frame (much lower latency than a fixed setTimeout interval) until it
-  // returns a truthy value or `timeoutMs` elapses.
-  function pollUntil(checkFn, timeoutMs, onSuccess, onTimeout) {
-    const startedAt = Date.now();
-    function frame() {
-      let result;
-      try {
-        result = checkFn();
-      } catch (err) {
-        logError("pollUntil checkFn failed", err);
-        result = null;
-      }
-      if (result) {
-        onSuccess(result, Date.now() - startedAt);
-        return;
-      }
-      if (Date.now() - startedAt >= timeoutMs) {
-        onTimeout(Date.now() - startedAt);
-        return;
-      }
-      requestAnimationFrame(frame);
-    }
-    requestAnimationFrame(frame);
-  }
-
-  function handlePoll(container) {
+  // Lets the site's own already-queued work run first. When a poll event
+  // arrives, our handler runs BEFORE the site has rendered what it just
+  // received (the hook's message is queued ahead of the site's own render),
+  // so "no poll UI on screen yet" at that instant does not mean the panel is
+  // closed. One task later it usually does — and that is a few milliseconds,
+  // not a timer: it is the only thing standing between "poll event" and
+  // "click", and it is what stops us toggling an already-open panel shut.
+  function afterSiteTask(fn, light) {
+    const finish = () => {
+      // In a hidden tab timers are throttled to ~1s, so skip the 2nd hop there
+      // (and `light` callers only ever want the single message-task hop).
+      if (light || document.hidden) fn();
+      else setTimeout(fn, 0);
+    };
     try {
-      // If this exact poll (by its real, unique ID from the WebSocket
-      // event) has already been successfully answered, don't process it
-      // again — a re-detected container for the same poll is most likely
-      // a results/confirmation view, not a new question.
-      if (currentPollMeta && currentPollMeta.pollId && consumedPollIds.has(currentPollMeta.pollId)) {
-        log(`Poll ${currentPollMeta.pollId} was already answered — ignoring re-detected container.`);
-        return;
+      const ch = new MessageChannel();
+      ch.port1.onmessage = () => {
+        ch.port1.close();
+        finish();
+      };
+      ch.port2.postMessage(0);
+    } catch (_e) {
+      finish();
+    }
+  }
+
+  // ================= Poll session =================
+  // Everything that happens for one poll — opening the panel, waiting for
+  // its UI, selecting, submitting — lives in ONE session object driven by
+  // ONE loop (superviseSession). That's deliberate: the site's poll icon is
+  // a *toggle*, and the old code had two independent code paths that could
+  // each click it (the WebSocket "start" event and the icon-color change).
+  // When both fired, or when either fired while the panel was already open,
+  // the net effect was closing the panel. Now there is exactly one place
+  // that ever clicks it (maybeOpenPanel), with rate limits.
+  let session = null;
+  let lastUiMark = null; // { node, sig } — the last poll UI we saw
+  let lastEndedAt = 0; // when the previous session ended
+  let lastIconClickAt = 0;
+  let sessionSeq = 0;
+  const handledPollStartIds = new Set();
+
+  function beginSession({ id, meta, source }) {
+    if (destroyed) return null;
+    const now = Date.now();
+    const durationMs = meta && typeof meta.durationMs === "number" ? meta.durationMs : CONFIG.UNKNOWN_POLL_WINDOW_MS;
+
+    if (session && session.state === "live" && now - session.startedAt < CONFIG.SIGNAL_MERGE_MS) {
+      // The icon's color change and the WebSocket "start" frame describe the
+      // same poll and land within milliseconds of each other, in either
+      // order. Fold them into one session so the panel is only opened once.
+      if (source === "ws" && session.source !== "ws") {
+        session.id = id;
+        session.source = "ws";
+        session.meta = meta;
+        session.deadlineAt = now + durationMs;
+        log("Poll session upgraded with WebSocket details:", id);
+        return session;
       }
+      if (source !== "ws") return session;
+    }
 
-      if (!selectedOption) {
-        setStatus("Poll detected, but no option was pre-selected!", "warning");
-        warn("Poll appeared with no pre-selected option.");
-        return;
-      }
+    if (session && session.state === "live") endSession(session, "superseded");
 
-      // If the WebSocket poll_start event gave us this poll's real
-      // option list, check the armed answer against it immediately.
-      // This is the site's own authoritative data (not a DOM guess), so
-      // a mismatch here means the armed answer genuinely isn't valid for
-      // this poll — no reason to waste the OPTION_FIND_TIMEOUT_MS window
-      // searching the DOM for something that can't exist.
-      if (currentPollMeta && Array.isArray(currentPollMeta.options) && currentPollMeta.options.length > 0) {
-        const normalized = selectedOption.toUpperCase();
-        if (!currentPollMeta.options.includes(normalized)) {
-          setStatus(
-            `Armed answer "${selectedOption}" isn't one of this poll's options (${currentPollMeta.options.join(", ")}).`,
-            "warning"
-          );
-          warn(`Selected option "${selectedOption}" isn't in this poll's real option list:`, currentPollMeta.options);
-          resetSelectionAfterPoll();
-          return;
-        }
-      }
+    const s = {
+      id,
+      source, // "ws" | "icon" | "dom"
+      meta, // { pollId, options, durationMs } from the WebSocket, or null
+      startedAt: now,
+      // Deliberately measured from *when we received the event*, not from the
+      // payload's pollStartTime: that timestamp is on the server's clock, and
+      // a PC clock that's even a little ahead made every poll look "already
+      // expired" and got it skipped.
+      deadlineAt: now + durationMs,
+      state: "live",
+      answered: false,
+      clicks: 0, // times WE clicked the poll icon for this poll
+      lastClickAt: 0,
+      userToggled: false, // the user clicked the icon themselves — stop touching it
+      attempt: null,
+      warnedUnarmed: false,
+      staleMark: lastUiMark, // what the poll UI looked like BEFORE this poll
+      settled: false, // true once the site has had one task to render what it just received
+    };
+    session = s;
+    log("Poll session started:", id, `(${source})`);
+    // If a poll UI is already showing, we act on it immediately (below). Only
+    // the decision to CLICK the toggle icon waits for this one-task yield.
+    afterSiteTask(() => {
+      s.settled = true;
+      if (session === s && s.state === "live") superviseSession();
+    });
+    kickSupervisor();
+    return s;
+  }
 
-      // The WebSocket payload also gives us this poll's real,
-      // authoritative deadline (pollStartTime + expiryDuration). Use it
-      // to make sure we never attempt to click Submit after the poll has
-      // actually closed, and to shorten the configured delay/timeout if
-      // they'd otherwise run past it — rather than blindly trusting
-      // settings.submitDelayMs regardless of how much real time is left.
-      let effectiveSubmitDelayMs = settings.submitDelayMs;
-      let effectiveSubmitTimeoutMs = CONFIG.SUBMIT_TIMEOUT_MS;
-      if (currentPollMeta && typeof currentPollMeta.deadlineMs === "number") {
-        const realRemainingMs = currentPollMeta.deadlineMs - Date.now();
-        if (realRemainingMs <= 0) {
-          setStatus("This poll has already expired (per its real timing) — not attempting to submit.", "warning");
-          warn("Poll deadline (from WebSocket-reported expiry) has already passed; skipping.");
-          resetSelectionAfterPoll();
-          return;
-        }
-        const safetyMarginMs = 300; // leave room for the click itself to land
-        const usableWindowMs = Math.max(0, realRemainingMs - safetyMarginMs);
-        if (effectiveSubmitDelayMs > usableWindowMs) {
-          log(
-            `Configured delay (${effectiveSubmitDelayMs}ms) exceeds this poll's real remaining time ` +
-              `(${realRemainingMs}ms) — shortening to fit.`
-          );
-          effectiveSubmitDelayMs = usableWindowMs;
-        }
-        effectiveSubmitTimeoutMs = Math.min(effectiveSubmitTimeoutMs, usableWindowMs);
-      }
-
-      // The poll's heading can render an instant before its option
-      // buttons do, so give it a brief window (checked every frame, not
-      // on a slow fixed interval) rather than failing on the very first
-      // look.
-      pollUntil(
-        makeOptionButtonFinder(container, selectedOption),
-        CONFIG.OPTION_FIND_TIMEOUT_MS,
-        (optionBtn) => {
-          optionBtn.click();
-          setStatus(`Selected "${selectedOption}".`, "ready");
-
-          if (!settings.autoSubmitEnabled) {
-            log("Auto-submit is off; leaving submission to the user.");
-            return;
-          }
-
-          setTimeout(() => {
-            const submitStartedAt = Date.now();
-            const findSubmitReady = makeSubmitButtonFinder();
-            pollUntil(
-              findSubmitReady,
-              effectiveSubmitTimeoutMs,
-              (submitBtn) => {
-                submitBtn.click();
-                const elapsed = Date.now() - submitStartedAt;
-                const note = elapsed > 60 ? " (waited for Submit to become clickable)" : "";
-                setStatus(`Submitted "${selectedOption}" in ${elapsed}ms${note}.`, "success");
-                if (currentPollMeta && currentPollMeta.pollId) {
-                  consumedPollIds.add(currentPollMeta.pollId);
-                  if (consumedPollIds.size > 200) {
-                    const oldest = consumedPollIds.values().next().value;
-                    consumedPollIds.delete(oldest);
-                  }
-                }
-                resetSelectionAfterPoll();
-              },
-              () => {
-                setStatus(`Selected "${selectedOption}", but couldn't find/click Submit button.`, "warning");
-                warn("Gave up looking for a clickable Submit button after the timeout.");
-                resetSelectionAfterPoll();
-              }
-            );
-          }, effectiveSubmitDelayMs);
-        },
-        () => {
-          setStatus(`Poll detected, but option "${selectedOption}" wasn't found.`, "warning");
-          warn(`Option "${selectedOption}" not found in poll markup — site layout may have changed.`);
-          // Clear the stale selection rather than leaving it armed — this
-          // poll is a lost cause either way (it won't be retried; see
-          // lastHandledPollNode), and leaving an old answer "armed" risks
-          // it silently getting applied to a completely different,
-          // unrelated poll that appears next if the user forgets to
-          // re-pick.
-          resetSelectionAfterPoll();
-        }
-      );
-    } catch (err) {
-      logError("handlePoll failed", err);
-      setStatus("Something went wrong handling this poll — check the console.", "warning");
+  function endSession(s, reason) {
+    if (!s || s.state === "ended") return;
+    s.state = "ended";
+    dropAttempt(s);
+    lastEndedAt = Date.now();
+    noteUi(currentPollContainer(), true);
+    if (reason === "expired" && !s.answered && selectedOption && armedAt <= s.deadlineAt) {
+      // The armed answer was meant for this poll and the poll is over. Don't
+      // leave it armed to fire on some later, unrelated poll. (An answer armed
+      // AFTER the deadline is for the next poll, so it's left alone.)
+      setStatus("The poll ended before your answer could be submitted.", "warning");
       resetSelectionAfterPoll();
     }
+    log("Poll session ended:", s.id, `(${reason})`);
   }
 
-  function watchForPollGone(container) {
-    if (pollGoneIntervalId) clearInterval(pollGoneIntervalId);
-    pollGoneIntervalId = setInterval(() => {
-      if (!document.body.contains(container)) {
-        lastHandledPollNode = null;
-        // Deliberately NOT clearing currentPollMeta here. If the site
-        // replaces the voting container with a different DOM node for a
-        // results/confirmation view of the *same* poll, this container
-        // is correctly detected as "gone" — but currentPollMeta.pollId
-        // needs to stay valid past that moment for the
-        // consumedPollIds check in handlePoll() to recognize that
-        // re-rendered node as the same already-answered poll, not a new
-        // one. currentPollMeta is only ever overwritten by a genuinely
-        // new WebSocket poll_start event (see handlePollSocketPayload),
-        // which is the correct trigger for "this is really a new poll."
-        clearInterval(pollGoneIntervalId);
-        pollGoneIntervalId = null;
-        log("Poll node removed from DOM; ready for the next one.");
+  let supervisorRunning = false;
+  function kickSupervisor() {
+    if (supervisorRunning) return;
+    supervisorRunning = true;
+    const step = () => {
+      if (destroyed || !session || session.state === "ended") {
+        supervisorRunning = false;
+        return;
       }
-    }, CONFIG.POLL_GONE_CHECK_MS);
+      try {
+        superviseSession();
+      } catch (err) {
+        logError("superviseSession failed", err);
+      }
+      if (!session || session.state === "ended") supervisorRunning = false;
+      else if (session.answered) setTimeout(step, 250); // just watching the UI settle now
+      else nextFrame(step);
+    };
+    step();
   }
 
-  // ================= Detecting a pending poll (event-driven) =================
-  // The poll icon's SVG path fill changes from white (#ffffff, idle) to
-  // the site's theme color (var(--primary)) when a poll becomes pending.
-  // Important: this color appears to be a persistent "a poll has
-  // happened" marker rather than one that resets between polls, so we
-  // can't just check "is it currently colored" (that stays true for the
-  // rest of the class after the first poll and would cause continuous
-  // re-clicking). Instead we track the raw value and only act on it
-  // actually *changing* to a pending value (an edge), never on it simply
-  // remaining pending.
+  // Remember what the poll UI currently looks like, so the next poll can
+  // tell a leftover copy of this one from its own fresh UI.
+  let notedAt = 0;
+  function noteUi(container, force) {
+    // Fingerprinting the UI isn't free; a few times a second is plenty (and the
+    // final state is always recorded when a session ends — see endSession).
+    const t = Date.now();
+    if (!force && t - notedAt < 100) return;
+    notedAt = t;
+    // Always a NEW object: a session's staleMark is a snapshot of an earlier
+    // lastUiMark and must never change underneath it.
+    if (container) {
+      lastUiMark = { node: container, sig: uiSignature(container) };
+    } else if (lastUiMark && lastUiMark.node.isConnected) {
+      // The node is still there but is no longer a poll (results / "answer
+      // recorded"): remember what it looks like *now*, so a later poll
+      // rendered into the same node is recognised as new.
+      lastUiMark = { node: lastUiMark.node, sig: uiSignature(lastUiMark.node) };
+    }
+  }
+
+  // True while the poll UI on screen is still (an unchanged copy of) the
+  // previous poll's. Acting on it would select/submit into a poll that has
+  // already ended.
+  function isLeftoverUi(s, container, now) {
+    const m = s.staleMark;
+    if (!m || now - s.startedAt >= CONFIG.STALE_UI_TIMEOUT_MS) return false;
+    return container === m.node && uiSignature(container) === m.sig;
+  }
+
+  function clickPollIcon(reason) {
+    try {
+      const icon = document.querySelector("#poll-icon");
+      if (!icon) return false;
+      lastIconClickAt = Date.now();
+      icon.click();
+      log("Clicked poll icon —", reason);
+      return true;
+    } catch (err) {
+      logError("clickPollIcon failed", err);
+      return false;
+    }
+  }
+
+  // The ONLY place the poll icon gets clicked automatically. Called only
+  // when no poll UI is visible.
+  function maybeOpenPanel(s, now) {
+    if (!settings.autoOpenPollPanel) return;
+    if (s.userToggled) return; // the user is driving the panel — don't fight them
+    if (s.clicks >= CONFIG.MAX_OPEN_CLICKS) return;
+
+    if (s.clicks === 0) {
+      if (!s.settled) return; // one browser task — see afterSiteTask
+      // If the PREVIOUS poll's UI is still on screen, the panel is open: it is
+      // about to be swapped for the new poll (we then act on it with no click
+      // at all) or the site is about to close it (we then click the moment it
+      // has gone). Either way clicking now would toggle it shut, so we watch
+      // the screen instead of a clock. The cap only stops a panel that is
+      // permanently static from blocking us forever.
+      const oldUiStillShowing = !!(s.staleMark && isVisible(s.staleMark.node));
+      if (oldUiStillShowing && now - s.startedAt < CONFIG.OPEN_HOLD_MS) return;
+    } else {
+      // A second click is a toggle back — it only makes sense if the first
+      // one evidently didn't produce the poll, and only when an armed
+      // answer is actually waiting on it.
+      if (!selectedOption) return;
+      const opts = s.meta && Array.isArray(s.meta.options) && s.meta.options.length > 0 ? s.meta.options : null;
+      if (opts && !opts.includes(selectedOption.toUpperCase())) return; // not answerable — don't close a panel the user may want
+      if (now - s.lastClickAt < CONFIG.OPEN_VERIFY_MS) return;
+    }
+    if (now - lastIconClickAt < CONFIG.AUTO_OPEN_RETRY_MS) return; // hard floor, across every path
+
+    if (clickPollIcon(s.clicks === 0 ? `poll ${s.id} started, panel not showing it` : `retry — panel still not showing poll ${s.id}`)) {
+      s.clicks++;
+      s.lastClickAt = now;
+    }
+  }
+
+  function warnUnarmedOnce(s) {
+    if (s.warnedUnarmed) return;
+    s.warnedUnarmed = true;
+    setStatus("Poll detected, but no option was pre-selected!", "warning");
+    warn("Poll appeared with no pre-selected option.");
+  }
+
+  // One step of the loop that drives the current poll.
+  function superviseSession() {
+    const s = session;
+    if (!s || s.state === "ended") return;
+    const now = Date.now();
+    if (now > s.deadlineAt + CONFIG.POLL_END_GRACE_MS) {
+      endSession(s, "expired");
+      return;
+    }
+
+    const container = currentPollContainer();
+    noteUi(container);
+    if (s.answered) return; // nothing left to do for this poll
+
+    if (now > s.deadlineAt) {
+      // The poll's window is over. The grace period exists so an attempt
+      // that's already in flight can finish or fail cleanly, and so we can
+      // watch the site swap its UI (which lets the next poll tell this one's
+      // leftovers from its own) — never to start new work on a dead poll.
+      if (s.attempt) advanceAttempt(s, container, now);
+      return;
+    }
+
+    if (s.attempt) {
+      advanceAttempt(s, container, now);
+      return;
+    }
+    if (container) {
+      if (isLeftoverUi(s, container, now)) return; // wait for the site to swap in the new poll
+      if (!selectedOption) {
+        warnUnarmedOnce(s);
+        return;
+      }
+      beginAttempt(s, container, now);
+      return;
+    }
+    maybeOpenPanel(s, now);
+  }
+
+  // ================= Selecting + submitting =================
+  function beginAttempt(s, container, now) {
+    const letter = selectedOption;
+    s.warnedUnarmed = true; // from here on the status line belongs to this attempt's outcome
+
+    // The WebSocket payload is the site's own authoritative data: if the
+    // armed answer isn't one of this poll's options, don't waste time
+    // searching the DOM for something that can't exist.
+    const opts = s.meta && Array.isArray(s.meta.options) && s.meta.options.length > 0 ? s.meta.options : null;
+    if (opts && !opts.includes(letter.toUpperCase())) {
+      setStatus(`Armed answer "${letter}" isn't one of this poll's options (${opts.join(", ")}).`, "warning");
+      warn(`Selected option "${letter}" isn't in this poll's real option list:`, opts);
+      resetSelectionAfterPoll();
+      return;
+    }
+
+    s.attempt = {
+      letter,
+      phase: "select", // select -> confirm -> delay -> submit
+      startedAt: now,
+      optionBtn: null,
+      selectedAt: 0,
+      delayMs: 0,
+      submitStartedAt: 0,
+      submitTimeoutMs: 0,
+      reselects: 0,
+      sawSelected: false, // the page has shown our option as selected at least once
+      clickedAt: 0, // when we last clicked the option
+      reacted: false, // the page changed the option in response to that click
+      hopStarted: false,
+      hopDone: false,
+      optionObserver: null,
+      lostAt: 0,
+    };
+    log(`Attempting "${letter}" on poll ${s.id}.`);
+    advanceAttempt(s, container, now);
+  }
+
+  // The page processes a click a moment AFTER the click handler returns (React
+  // and friends commit the new state in a later task). A Submit that lands
+  // before that goes out with no option selected — so after clicking the
+  // option we watch for the page's reaction (see "confirm" in advanceAttempt).
+  function stopOptionWatch(a) {
+    if (a && a.optionObserver) {
+      a.optionObserver.disconnect();
+      a.optionObserver = null;
+    }
+  }
+
+  function dropAttempt(s) {
+    if (s && s.attempt) stopOptionWatch(s.attempt);
+    if (s) s.attempt = null;
+  }
+
+  function watchOptionReaction(s, a, btn) {
+    stopOptionWatch(a);
+    try {
+      const mo = new MutationObserver(() => {
+        if (a.reacted) return;
+        a.reacted = true;
+        if (session === s && s.attempt === a) superviseSession(); // right now, not next frame
+      });
+      mo.observe(btn, { attributes: true, childList: true, subtree: true, characterData: true });
+      if (btn.parentElement) mo.observe(btn.parentElement, { attributes: true, childList: true });
+      a.optionObserver = mo;
+    } catch (err) {
+      logError("watchOptionReaction failed", err);
+    }
+  }
+
+  function clickOption(s, a, btn, now) {
+    a.optionBtn = btn;
+    a.clickedAt = now;
+    if (!a.selectedAt) a.selectedAt = now; // the delay you set counts from the FIRST selection
+    a.reacted = false;
+    a.hopStarted = false;
+    a.hopDone = false;
+    a.sawSelected = false;
+    watchOptionReaction(s, a, btn); // before the click, so a synchronous reaction is caught too
+    btn.click();
+    // Pages that react without touching the DOM (e.g. only a radio's `checked`)
+    // never trigger the observer — look again one task later.
+    afterSiteTask(() => {
+      if (session === s && s.attempt === a) superviseSession();
+    }, true);
+  }
+
+  function failAttempt(s, statusText, warnText) {
+    setStatus(statusText, "warning");
+    warn(warnText);
+    // Clear the armed answer rather than leaving it to silently fire on some
+    // later, unrelated poll if the user forgets to re-pick.
+    resetSelectionAfterPoll();
+    dropAttempt(s);
+  }
+
+  function advanceAttempt(s, container, now) {
+    const a = s.attempt;
+    if (!a) return;
+
+    // The user changed their mind while we were waiting (the submit delay
+    // can be up to a minute): honour the *current* choice, never a stale one.
+    if (!selectedOption) {
+      dropAttempt(s);
+      setStatus("Answer cleared — nothing was submitted.", "idle");
+      log("Armed answer was cleared mid-attempt; aborting.");
+      return;
+    }
+    if (selectedOption !== a.letter) {
+      dropAttempt(s); // the loop starts a fresh attempt with the new letter
+      log(`Armed answer changed ${a.letter} -> ${selectedOption} mid-attempt; restarting.`);
+      return;
+    }
+
+    const remainingMs = s.deadlineAt - now;
+    if (remainingMs <= 0) {
+      failAttempt(s, "This poll has already ended — not attempting to submit.", "Poll window has passed; skipping.");
+      return;
+    }
+    const usableMs = Math.max(0, remainingMs - CONFIG.SUBMIT_SAFETY_MARGIN_MS);
+
+    if (!container) {
+      // The poll UI is gone (panel closed, site swapped it out, or you
+      // submitted by hand). Give it a moment to come back before giving up.
+      if (!a.lostAt) a.lostAt = now;
+      if (now - a.lostAt >= CONFIG.SUBMIT_TIMEOUT_MS) {
+        failAttempt(s, "The poll closed before your answer could be submitted.", "Poll UI disappeared mid-attempt.");
+      }
+      return;
+    }
+    if (a.lostAt) {
+      a.lostAt = 0;
+      a.startedAt = now; // it's back: restart the "wait for the option to render" clock
+    }
+
+    if (a.phase === "select") {
+      const btn = findMatchingOptionButton(container, a.letter);
+      if (!btn) {
+        if (now - a.startedAt >= CONFIG.OPTION_FIND_TIMEOUT_MS) {
+          failAttempt(
+            s,
+            `Poll detected, but option "${a.letter}" wasn't found.`,
+            `Option "${a.letter}" not found in poll markup — site layout may have changed.`
+          );
+        }
+        return;
+      }
+      clickOption(s, a, btn, now);
+      setStatus(`Selected "${a.letter}".`, "ready");
+
+      if (!settings.autoSubmitEnabled) {
+        log("Auto-submit is off; leaving submission to the user.");
+        resetSelectionAfterPoll(); // one-shot, exactly like a submitted answer
+        dropAttempt(s);
+        return;
+      }
+      // Shorten the configured delay if it would run past the poll's real window.
+      a.delayMs = Math.min(settings.submitDelayMs, usableMs);
+      a.phase = "confirm";
+      return; // Submit must wait for the page to register the option — see below
+    }
+
+    // If the site re-rendered and replaced the option we clicked, look at the
+    // new element: if the page already shows it selected, that's our click
+    // carried over; otherwise our selection went with the old node — pick again.
+    if (a.optionBtn && !a.optionBtn.isConnected) {
+      const fresh = findMatchingOptionButton(container, a.letter);
+      if (fresh && isOptionSelected(fresh) === true) {
+        a.optionBtn = fresh;
+        a.sawSelected = true;
+        a.reacted = true;
+      } else {
+        if (++a.reselects > 3) {
+          failAttempt(s, `Selected "${a.letter}", but the poll kept re-rendering.`, "Option element kept getting replaced.");
+          return;
+        }
+        log("Option element was replaced by a re-render; selecting again.");
+        a.phase = "select";
+        a.startedAt = now;
+        return;
+      }
+    }
+
+    // The page can reset the selection under us (a re-render, a repeated
+    // event). If we saw our option selected and it no longer is, select it
+    // again — the delay you set keeps counting from the FIRST selection.
+    // Only when the page really reports selection state, so a UI that
+    // doesn't can never be toggled off by a needless second click.
+    const sel = isOptionSelected(a.optionBtn);
+    if (sel === true) {
+      a.sawSelected = true;
+    } else if (sel === false && a.sawSelected) {
+      if (++a.reselects > 3) {
+        failAttempt(s, `Selected "${a.letter}", but the poll kept resetting it.`, "Selection kept being reset by the page.");
+        return;
+      }
+      log("The page reset the selection; selecting again.");
+      clickOption(s, a, a.optionBtn, now);
+      a.phase = "confirm";
+      return;
+    }
+
+    if (a.phase === "confirm") {
+      // Don't click Submit until the page has MARKED the option: it either
+      // reports it selected, or visibly reacted to our click. (Event-driven —
+      // typically a few ms. The cap only keeps a page that shows no sign at all
+      // from stalling us.)
+      const marked = a.sawSelected || a.reacted;
+      if (marked && !a.hopStarted) {
+        a.hopStarted = true;
+        // One more task so anything else the page queued for this click finishes.
+        afterSiteTask(() => {
+          a.hopDone = true;
+          if (session === s && s.attempt === a) superviseSession();
+        }, true);
+      }
+      if (!(marked && a.hopDone) && now - a.clickedAt < CONFIG.SELECTION_CONFIRM_MS) return;
+      stopOptionWatch(a);
+      a.phase = "delay";
+    }
+
+    if (a.phase === "delay") {
+      if (now - a.selectedAt < a.delayMs) return;
+      a.phase = "submit";
+      a.submitStartedAt = now;
+      a.submitTimeoutMs = Math.min(CONFIG.SUBMIT_TIMEOUT_MS, usableMs);
+    }
+
+    if (a.phase === "submit") {
+      const btn = findSubmitButton(container);
+      if (btn && !btn.disabled && btn.getAttribute("aria-disabled") !== "true") {
+        btn.click();
+        const elapsed = now - a.submitStartedAt;
+        const note = elapsed > 60 ? " (waited for Submit to become clickable)" : "";
+        setStatus(`Submitted "${a.letter}" in ${elapsed}ms${note}.`, "success");
+        s.answered = true;
+        dropAttempt(s);
+        resetSelectionAfterPoll();
+        return;
+      }
+      if (now - a.submitStartedAt >= a.submitTimeoutMs) {
+        failAttempt(
+          s,
+          `Selected "${a.letter}", but couldn't find/click Submit button.`,
+          "Gave up looking for a clickable Submit button after the timeout."
+        );
+      }
+    }
+  }
+
+  // The user just armed an answer. If a poll is running right now, act on it
+  // immediately (opening the panel if it isn't showing) instead of waiting
+  // for the next one.
+  function onAnswerArmed() {
+    if (!selectedOption) return;
+    armedAt = Date.now();
+    const s = session;
+    if (s && s.state === "live") {
+      // Already answered, or its window has passed: the pick is for the next poll.
+      if (s.answered || armedAt > s.deadlineAt) return;
+      s.userToggled = false; // arming is the user's latest, explicit instruction
+      if (s.clicks >= CONFIG.MAX_OPEN_CLICKS) {
+        s.clicks = 0;
+        s.lastClickAt = 0;
+      }
+      log("Answer armed while a poll is running — acting on it now.");
+      superviseSession();
+      return;
+    }
+    detectDomOnlyPoll();
+  }
+
+  // ================= Fallback detection (no WebSocket info) =================
+  // A live poll UI is on screen and an answer is armed, but no WebSocket
+  // event told us about it (missed frame, socket reconnecting, ...).
+  function detectDomOnlyPoll() {
+    if (!selectedOption) return;
+    if (session && session.state === "live") return;
+    // Right after a poll ends the site often shows a results view built from the
+    // same markup; give it a moment rather than mistake that for a new poll.
+    if (Date.now() - lastEndedAt < CONFIG.POST_POLL_QUIET_MS) return;
+    const container = currentPollContainer();
+    if (!container) return;
+    if (lastUiMark && lastUiMark.node === container && lastUiMark.sig === uiSignature(container)) return; // same UI we already dealt with
+    if (!looksLikeLiveVote(container)) return;
+    beginSession({ id: `dom-${++sessionSeq}`, meta: null, source: "dom" });
+  }
+
+  // ================= Detecting a pending poll via the icon color =================
+  // The poll icon's SVG path fill changes from white (#ffffff, idle) to the
+  // site's theme color when a poll becomes pending. Important: this color
+  // appears to be a persistent "a poll has happened" marker rather than one
+  // that resets between polls, so we only act on it actually *changing* to
+  // a pending value (an edge), never on it simply remaining pending. This
+  // is a fallback signal only — it never clicks anything itself; it just
+  // starts a session, and the session decides whether opening is needed.
   function getPollIconFill() {
     try {
       const pollIcon = document.querySelector("#poll-icon");
@@ -737,33 +1248,18 @@
   }
 
   let lastKnownPollIconFill = null; // null = not yet observed
-  let lastAutoOpenAttempt = 0;
-  function maybeAutoOpenPollPanel() {
-    if (!settings.autoOpenPollPanel) return;
-    if (findPollContainer()) return; // already open — never toggle it closed
-    try {
-      const fill = getPollIconFill();
-      if (fill === null) return; // icon not present yet
-
-      if (fill === lastKnownPollIconFill) return; // no change — nothing to do
-
-      const wasPending = isPendingFillValue(lastKnownPollIconFill);
-      const isPendingNow = isPendingFillValue(fill);
-      lastKnownPollIconFill = fill;
-
-      if (!isPendingNow || wasPending) return; // only act on a fresh 0→1 transition
-
-      const now = Date.now();
-      if (now - lastAutoOpenAttempt < CONFIG.AUTO_OPEN_RETRY_MS) return;
-      lastAutoOpenAttempt = now;
-
-      const pollIcon = document.querySelector("#poll-icon");
-      if (!pollIcon) return;
-      pollIcon.click();
-      log("Poll icon just switched to its pending color — clicked it to open the panel.");
-    } catch (err) {
-      logError("maybeAutoOpenPollPanel failed", err);
+  function checkPollIconFill() {
+    const fill = getPollIconFill();
+    if (fill === null) return;
+    if (lastKnownPollIconFill === null) {
+      lastKnownPollIconFill = fill; // first look just establishes the baseline
+      return;
     }
+    if (fill === lastKnownPollIconFill) return;
+    const wasPending = isPendingFillValue(lastKnownPollIconFill);
+    lastKnownPollIconFill = fill;
+    if (!isPendingFillValue(fill) || wasPending) return; // only a fresh idle -> pending edge counts
+    beginSession({ id: `icon-${++sessionSeq}`, meta: null, source: "icon" });
   }
 
   // A dedicated, narrowly-scoped observer on just the poll icon's own SVG
@@ -780,7 +1276,7 @@
       if (!path || path === watchedPollIconPath) return;
       if (pollIconObserver) pollIconObserver.disconnect();
       pollIconObserver = new MutationObserver(() => {
-        maybeAutoOpenPollPanel();
+        checkPollIconFill();
       });
       pollIconObserver.observe(path, { attributes: true, attributeFilter: ["fill"] });
       watchedPollIconPath = path;
@@ -788,6 +1284,42 @@
     } catch (err) {
       logError("ensurePollIconWatched failed", err);
     }
+  }
+
+  // If the user clicks the poll icon themselves, they're driving the panel —
+  // from then on this poll, we never click it for them (unless they arm an
+  // answer, which is an explicit request; see onAnswerArmed).
+  document.addEventListener(
+    "click",
+    (e) => {
+      if (!e.isTrusted || !session || session.state === "ended") return;
+      const t = e.target;
+      if (t && t.closest && t.closest("#poll-icon")) session.userToggled = true;
+    },
+    true
+  );
+
+  // Could this batch of DOM changes involve the poll UI? Chat messages and
+  // other page noise never add buttons/inputs, so they don't warrant an
+  // immediate re-check (the per-frame loop still covers everything else).
+  function mutationsRelevant(records) {
+    try {
+      const container = scanCache.node;
+      for (const r of records) {
+        if (r.type === "attributes") return true; // only "disabled" is observed
+        for (const n of r.addedNodes) {
+          if (n.nodeType === 1 && (n.matches("button, input") || n.querySelector("button, input"))) return true;
+        }
+        for (const n of r.removedNodes) {
+          if (n.nodeType !== 1) continue;
+          if (container && (n === container || n.contains(container))) return true;
+          if (n.matches("button, input") || n.querySelector("button, input")) return true;
+        }
+      }
+    } catch (_e) {
+      return true; // when in doubt, check
+    }
+    return false;
   }
 
   // ================= Main observer loop =================
@@ -832,16 +1364,8 @@
 
     ensureButtonExists();
     ensurePollIconWatched();
-
-    const container = findPollContainer();
-    if (container && container !== lastHandledPollNode) {
-      lastHandledPollNode = container;
-      log("New poll detected.");
-      handlePoll(container);
-      watchForPollGone(container);
-    } else if (!container) {
-      maybeAutoOpenPollPanel();
-    }
+    checkPollIconFill();
+    detectDomOnlyPoll();
   }
 
   // Coalesces potentially-many MutationObserver callbacks (a busy SPA can
@@ -852,7 +1376,7 @@
   function scheduleTick() {
     if (tickScheduled) return;
     tickScheduled = true;
-    requestAnimationFrame(() => {
+    nextFrame(() => {
       tickScheduled = false;
       tick();
     });
@@ -862,14 +1386,28 @@
     loadSettings();
 
     try {
-      observer = new MutationObserver(scheduleTick);
+      observer = new MutationObserver((records) => {
+        domDirty = true;
+        // While a poll is being worked on, react at once (this callback runs
+        // right after the DOM change) instead of waiting for the next frame.
+        if (session && session.state === "live" && mutationsRelevant(records)) {
+          try {
+            superviseSession();
+          } catch (err) {
+            logError("superviseSession failed", err);
+          }
+        }
+        scheduleTick();
+      });
       // Broad attribute watching across the whole page would be
       // expensive (lots of unrelated elements churn class/style
       // attributes). Poll-container detection only needs childList
       // changes; the poll icon's own fill-color change is watched
       // separately by a narrowly-scoped observer (see
       // ensurePollIconWatched) for a cheap, instant reaction instead.
-      observer.observe(document.documentElement, { childList: true, subtree: true });
+      // "disabled" is watched too so a Submit button that becomes enabled is
+      // clicked the moment it does. (Watching class/style would be far too noisy.)
+      observer.observe(document.documentElement, { childList: true, subtree: true, attributes: true, attributeFilter: ["disabled"] });
     } catch (err) {
       logError("Failed to start MutationObserver", err);
     }
@@ -877,6 +1415,13 @@
     // 500ms rather than 1000ms so the pending-poll color change (and any
     // SPA re-renders the MutationObserver misses) gets picked up promptly.
     injectPollId = setInterval(tick, 500);
+    // Coming back to a tab that sat in the background: catch up immediately.
+    document.addEventListener("visibilitychange", () => {
+      if (!document.hidden) {
+        domDirty = true;
+        scheduleTick();
+      }
+    });
     tick();
 
     trackingRafId = requestAnimationFrame(trackPosition);
@@ -896,7 +1441,6 @@
       logError("Error disconnecting poll-icon observer", err);
     }
     if (injectPollId) clearInterval(injectPollId);
-    if (pollGoneIntervalId) clearInterval(pollGoneIntervalId);
     if (trackingRafId) cancelAnimationFrame(trackingRafId);
     log("Cleaned up.");
   }
@@ -907,20 +1451,9 @@
   //   "poll {"operation":"start","pollId":"...","data":{...}}"
   // and a corresponding "stop_expiry" event as it's about to close. This
   // is far more reliable than watching for DOM/color changes — it fires
-  // fresh for every single poll, not just the first. When available
-  // (live classes), it's used to trigger opening the poll panel
-  // immediately; the DOM-based color-change detection stays in place as
-  // a fallback for contexts without this socket (e.g. recorded classes).
-  const handledPollStartIds = new Set();
-  // Tracks poll IDs we've successfully selected+submitted an answer for.
-  // Unlike lastHandledPollNode (which is tied to a specific DOM node
-  // reference and reset once that node is removed), this is identity-
-  // based and durable — it stays valid even if the site re-renders the
-  // same poll into a different DOM subtree afterward (e.g. a results or
-  // "your answer was recorded" view), preventing that from being
-  // mistaken for a brand new poll to answer.
-  const consumedPollIds = new Set();
-
+  // fresh for every single poll, not just the first. It starts a poll
+  // session; the DOM-based color-change detection above stays in place as
+  // a fallback for when a frame is ever missed.
   function parseWSFrame(raw) {
     if (typeof raw !== "string") return null;
     const spaceIdx = raw.indexOf(" ");
@@ -937,30 +1470,6 @@
       return { topic, payload: JSON.parse(jsonPart) };
     } catch (_e) {
       return null;
-    }
-  }
-
-  function openPollPanelNow(reason) {
-    if (!settings.autoOpenPollPanel) return;
-    // Deliberately no "is a poll already open" check here, unlike
-    // maybeAutoOpenPollPanel below. This path only ever runs in response
-    // to a WebSocket poll_start event for a specific, unique pollId
-    // (deduped via handledPollStartIds — see handlePollSocketPayload),
-    // which is a far stronger and more precise signal than "does some
-    // poll-shaped DOM node currently exist." That looser DOM check was
-    // tried here previously and caused false positives: if the
-    // *previous* poll's container lingers in the DOM for a moment after
-    // it ends (e.g. showing a brief results state) right as a new poll's
-    // start event arrives, it would look like "already open" and the
-    // click would be silently skipped — leaving the new poll unopened
-    // until manually clicked.
-    try {
-      const pollIcon = document.querySelector("#poll-icon");
-      if (!pollIcon) return;
-      pollIcon.click();
-      log("Clicked poll icon —", reason);
-    } catch (err) {
-      logError("openPollPanelNow failed", err);
     }
   }
 
@@ -986,14 +1495,11 @@
             .map((o) => (o && typeof o.optionLabel === "string" ? o.optionLabel.trim().toUpperCase() : null))
             .filter(Boolean)
         : null;
-      let deadlineMs = null;
-      if (typeof data.pollStartTime === "number" && typeof data.expiryDuration === "number") {
-        deadlineMs = (data.pollStartTime + data.expiryDuration) * 1000;
-      }
-      currentPollMeta = { pollId: pollId || null, options: realOptions, deadlineMs };
-      log("Captured real poll metadata from WebSocket:", currentPollMeta);
+      const durationMs = typeof data.expiryDuration === "number" && data.expiryDuration > 0 ? data.expiryDuration * 1000 : null;
+      const meta = { pollId: pollId || null, options: realOptions, durationMs };
+      log("Captured real poll metadata from WebSocket:", meta);
 
-      openPollPanelNow(`WebSocket confirmed poll ${pollId || "(unknown id)"} started`);
+      beginSession({ id: pollId || `ws-${++sessionSeq}`, meta, source: "ws" });
     } else if (op === "stop_expiry" || op === "stop" || op === "end") {
       log("WebSocket: poll", pollId || "(unknown id)", "is stopping/ending — operation:", op);
     }
@@ -1019,8 +1525,13 @@
     }
   });
 
-  window.addEventListener("pagehide", destroy);
-  window.addEventListener("beforeunload", destroy);
+  // Only tear down on a real unload. `beforeunload` is NOT one: it also fires
+  // when the user cancels a "leave this page?" prompt (or starts a download /
+  // mailto: navigation), after which the page carries on — and the extension,
+  // having destroyed itself, silently stopped working until a reload.
+  window.addEventListener("pagehide", (e) => {
+    if (!e.persisted) destroy();
+  });
 
   start();
 })();
